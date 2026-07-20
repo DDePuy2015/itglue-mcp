@@ -157,4 +157,43 @@ describe("tenant flexible-asset tools", () => {
     const body = patch.mock.calls[0][1] as { data: { attributes: { traits: Record<string, unknown> } } };
     expect(body.data.attributes.traits).not.toHaveProperty("pre-shared-key");
   });
+
+  it.each([
+    {
+      tool: "search_printers",
+      record: { id: "1", name: "Finance Printer", traits: { "device-name": "Finance Printer", location: { type: "Locations", values: [{ id: 42 }] } } },
+      expected: { device_name: "Finance Printer", location_ids: [42] },
+    },
+    {
+      tool: "search_applications",
+      record: { id: "2", name: "ERP", traits: { name: "ERP", "application-champion": { type: "Contacts", values: [{ id: 51 }] } } },
+      expected: { name: "ERP", application_champion: [51] },
+    },
+    {
+      tool: "search_wan_links",
+      record: { id: "3", name: "Fiber - Acme", traits: { provider: "Acme", "link-type": "Fiber", "location-s": { type: "Locations", values: [{ id: 42 }] } } },
+      expected: { provider: "Acme", link_type: "Fiber", location_ids: [42] },
+    },
+    {
+      tool: "search_lan_networks",
+      record: { id: "4", name: "Core LAN", traits: { name: "Core LAN", location: { type: "Locations", values: [{ id: 42 }] }, subnet: "10.0.0.0/24" } },
+      expected: { name: "Core LAN", location_ids: [42], subnet: "10.0.0.0/24" },
+    },
+    {
+      tool: "search_wireless_networks",
+      record: { id: "5", name: "Corp - Corp", traits: { "network-name": "Corp", ssid: "Corp", "physical-location": { type: "Locations", values: [{ id: 42 }] }, "encryption-type": "WPA2-Personal", "pre-shared-key": "secret" } },
+      expected: { network_name: "Corp", ssid: "Corp", physical_location_ids: [42], encryption_type: "WPA2-Personal" },
+    },
+  ])("normalizes live $tool fixture relationships and redacts passwords", async ({ tool, record, expected }) => {
+    const client = fakeClient({
+      request: vi.fn(async (path) => path.startsWith("/flexible_asset_types/")
+        ? { data: [], meta: {} }
+        : { data: [record], meta: {} }),
+    });
+    const result = await handleFlexibleAssetTool(tool, { organization_id: 123 }, client);
+    expect(result?.isError).not.toBe(true);
+    const payload = JSON.parse(result?.content[0].text ?? "{}");
+    expect(payload.data[0].fields).toMatchObject(expected);
+    expect(payload.data[0].fields).not.toHaveProperty("pre_shared_key");
+  });
 });
