@@ -108,8 +108,8 @@ describe("tenant flexible-asset tools", () => {
       fields: { mac_address: "00:11:22:33:44:55" },
     }, client);
     expect(result?.isError).not.toBe(true);
-    expect(request.mock.calls[0][0]).toBe("/flexible_assets");
-    expect(request.mock.calls[0][1]).toMatchObject({ filter: { id: 17, flexibleAssetTypeId: 379697, organizationId: 123 } });
+    const assetRequest = request.mock.calls.find((args) => args[0] === "/flexible_assets");
+    expect(assetRequest?.[1]).toMatchObject({ filter: { id: 17, flexibleAssetTypeId: 379697, organizationId: 123 } });
     const body = patch.mock.calls[0][1] as { data: { attributes: { traits: Record<string, unknown> } } };
     expect(body.data.attributes.traits.location).toEqual([42]);
     expect(body.data.attributes.traits["admin-credentials"]).toEqual([55]);

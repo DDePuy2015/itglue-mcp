@@ -441,6 +441,18 @@ async function loadDynamicFields(client: FlexibleAssetClient, typeId: number): P
   return fields;
 }
 
+async function liveSchema(client: FlexibleAssetClient, schema: FlexibleAssetSchema): Promise<FlexibleAssetSchema> {
+  const liveFields = await loadDynamicFields(client, schema.typeId);
+  const usableFields = liveFields.filter((fieldDef) => fieldDef.nameKey.length > 0);
+  if (usableFields.length === 0) return schema;
+  const byId = new Map(usableFields.map((fieldDef) => [fieldDef.id, fieldDef]));
+  const byNameKey = new Map(usableFields.map((fieldDef) => [fieldDef.nameKey, fieldDef]));
+  return {
+    ...schema,
+    fields: schema.fields.map((fieldDef) => byId.get(fieldDef.id) ?? byNameKey.get(fieldDef.nameKey) ?? fieldDef),
+  };
+}
+
 export async function redactFlexibleAssetResult(client: FlexibleAssetClient, typeId: number, result: JsonRecord): Promise<JsonRecord> {
   const fields = await loadDynamicFields(client, typeId);
   return {
@@ -535,8 +547,9 @@ export async function handleFlexibleAssetTool(name: string, args: JsonRecord, cl
       const organizationId = numberId(args.organization_id, "organization_id");
       const results: JsonRecord = { organizationId };
       for (const config of FLEXIBLE_ASSET_TOOL_CONFIGS.slice(2)) {
-        const records = await fetchAssets(client, config.schema, organizationId);
-        results[config.schema.name] = records.map((record) => normalizeRecord(redactRecord(record, config.schema.fields), config.schema));
+        const schema = await liveSchema(client, config.schema);
+        const records = await fetchAssets(client, schema, organizationId);
+        results[schema.name] = records.map((record) => normalizeRecord(redactRecord(record, schema.fields), schema));
       }
       return textResult(results);
     } catch (error) {
@@ -548,7 +561,7 @@ export async function handleFlexibleAssetTool(name: string, args: JsonRecord, cl
   if (!config) return undefined;
   try {
     const organizationId = numberId(args.organization_id, "organization_id");
-    const { schema } = config;
+    const schema = await liveSchema(client, config.schema);
 
     if (name === config.searchName) {
       const pageSize = typeof args.page_size === "number" ? Math.min(Math.max(Math.trunc(args.page_size), 1), 1000) : 100;
