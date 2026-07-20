@@ -367,10 +367,8 @@ async function fetchAssets(
   organizationId: number,
   pageSize = 100,
   pageNumber = 1,
-  name?: string,
 ): Promise<JsonRecord[]> {
   const filter: JsonRecord = { flexibleAssetTypeId: schema.typeId, organizationId };
-  if (name) filter.name = name;
   const result = await client.request<JsonRecord>("/flexible_assets", {
     filter,
     page: { size: pageSize, number: pageNumber },
@@ -564,10 +562,14 @@ export async function handleFlexibleAssetTool(name: string, args: JsonRecord, cl
     const schema = await liveSchema(client, config.schema);
 
     if (name === config.searchName) {
-      const pageSize = typeof args.page_size === "number" ? Math.min(Math.max(Math.trunc(args.page_size), 1), 1000) : 100;
-      const pageNumber = typeof args.page_number === "number" ? Math.max(Math.trunc(args.page_number), 1) : 1;
       const nameQuery = typeof args.name === "string" ? args.name.trim() : "";
-      const records = await fetchAssets(client, schema, organizationId, pageSize, pageNumber, nameQuery || undefined);
+      const pageSize = typeof args.page_size === "number"
+        ? Math.min(Math.max(Math.trunc(args.page_size), 1), 1000)
+        : nameQuery ? 1000 : 100;
+      const pageNumber = typeof args.page_number === "number" ? Math.max(Math.trunc(args.page_number), 1) : 1;
+      // IT Glue's filter[name] is exact-match only. Fetch the page and apply
+      // the user-facing partial match locally so "corp" finds "Corp Wi-Fi".
+      const records = await fetchAssets(client, schema, organizationId, pageSize, pageNumber);
       const nameFilter = typeof args.name === "string" ? args.name.trim().toLowerCase() : "";
       const filtered = nameFilter ? records.filter((record) => String(record.name ?? "").toLowerCase().includes(nameFilter)) : records;
       return textResult({ data: filtered.map((record) => normalizeRecord(redactRecord(record, schema.fields), schema)) });
