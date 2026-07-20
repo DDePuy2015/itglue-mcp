@@ -20,6 +20,11 @@ import { elicitSelection, elicitText } from "./utils/elicitation.js";
 import { registerPromptHandlers } from "./prompts.js";
 import { registerResourceHandlers } from "./resources.js";
 import { buildDocumentCard, DOCUMENT_CARD_META } from "./card.builder.js";
+import {
+  flexibleAssetToolDefinitions,
+  handleFlexibleAssetTool,
+  redactFlexibleAssetResult,
+} from "./flexible-assets.js";
 
 
 // IT Glue region configuration
@@ -1446,6 +1451,7 @@ export function createMcpServer(credentialOverrides?: GatewayCredentials): Serve
           required: ["flexible_asset_type_id"],
         },
       },
+      ...flexibleAssetToolDefinitions(),
       // Health check
       {
         name: "itglue_health_check",
@@ -1528,6 +1534,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   try {
     const client = createClient(effectiveCredentials);
+
+    const customFlexibleAssetResult = await handleFlexibleAssetTool(
+      name,
+      (args ?? {}) as Record<string, unknown>,
+      client
+    );
+    if (customFlexibleAssetResult) return customFlexibleAssetResult;
 
     switch (name) {
       // Organizations
@@ -2370,11 +2383,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
 
         const result = await client.request("/flexible_assets", params);
+        const redactedResult = await redactFlexibleAssetResult(
+          client,
+          Number(args.flexible_asset_type_id),
+          result as unknown as Record<string, unknown>
+        );
         return {
           content: [
             {
               type: "text",
-              text: JSON.stringify(result, null, 2),
+              text: JSON.stringify(redactedResult, null, 2),
             },
           ],
         };

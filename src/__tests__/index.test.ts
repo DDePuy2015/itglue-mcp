@@ -359,6 +359,29 @@ describe("Tool Definitions", () => {
     { name: "itglue_health_check", requiredFields: [] as string[], properties: [] as string[] },
   ];
 
+  tools.push(
+    ...[
+      "search_printers", "get_printer", "create_printer", "update_printer",
+      "search_applications", "get_application", "create_application", "update_application",
+      "search_wan_links", "get_wan_link", "create_wan_link", "update_wan_link",
+      "search_lan_networks", "get_lan_network", "create_lan_network", "update_lan_network",
+      "search_wireless_networks", "get_wireless_network", "create_wireless_network", "update_wireless_network",
+      "get_site_network_overview",
+    ].map((name) => ({
+      name,
+      requiredFields: name.startsWith("search_") || name === "get_site_network_overview"
+        ? ["organization_id"]
+        : name.startsWith("get_")
+          ? ["organization_id", "id"]
+          : ["organization_id", "fields"],
+      properties: name.startsWith("get_") && name !== "get_site_network_overview"
+        ? ["organization_id", "id"]
+        : name.startsWith("search_") || name === "get_site_network_overview"
+          ? ["organization_id"]
+          : ["organization_id", "fields"],
+    }))
+  );
+
   it.each(tools)("should define $name tool correctly", ({ name, requiredFields, properties }) => {
     expect(name).toBeTruthy();
     expect(Array.isArray(requiredFields)).toBe(true);
@@ -370,8 +393,8 @@ describe("Tool Definitions", () => {
     });
   });
 
-  it("should have 24 tools total", () => {
-    expect(tools.length).toBe(24);
+  it("should have 45 tools total", () => {
+    expect(tools.length).toBe(45);
   });
 });
 
@@ -2164,10 +2187,10 @@ describe("Locations tools (round-trip)", () => {
     );
   });
 
-  it("exposes 24 tools total", async () => {
+  it("exposes 45 tools total", async () => {
     const client = await connectLocationsClient();
     const { tools } = await client.listTools();
-    expect(tools.length).toBe(24);
+    expect(tools.length).toBe(45);
   });
 
   it("search_locations queries /locations filtered by organization and city", async () => {

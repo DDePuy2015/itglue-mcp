@@ -118,6 +118,14 @@ If you do need the JWT fallback, provide it in whichever way matches your deploy
 ### Flexible Assets
 
 - **search_flexible_assets** - Search for flexible assets (requires flexible_asset_type_id)
+- **Typed network and inventory tools** - Search and read Printers & Scanners (`379697`), Applications/Software (`54463`), Internet/WAN (`54455`), LAN (`53763`), and Wireless (`53878`) records with normalized numeric relationship IDs.
+- **Typed create/update tools** - Operators can create and update those five tenant-specific asset types after required-field, select-option, organization/type, and duplicate checks. Password, PSK, upload, and header fields are never accepted or returned.
+- **get_site_network_overview** - Read the WAN, LAN, and Wireless records for one organization in one response.
+
+The typed tools use the live tenant field definitions captured for Summit IT Glue.
+Generic flexible-asset search remains available for other types, but API Keys /
+Secret Keys (`393982`) are restricted to administrators and every field whose
+live kind is `Password` is redacted for all roles.
 
 ### Utility
 
