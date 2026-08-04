@@ -68,7 +68,9 @@ unauthenticated; `/ready` reports whether the backend token is configured.
 The proxy injects the backend token and does not forward caller-supplied IT Glue
 credential or backend-token headers. Direct calls to the private provider's
 `/mcp` endpoint therefore fail unless they originate from the configured proxy
-boundary.
+boundary. In Azure, keep this provider on internal ingress and configure the
+token through a managed secret reference; the token is defense in depth and is
+not a replacement for the private network boundary.
 
 ### JWT fallback for document-folder operations
 
