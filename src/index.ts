@@ -19,6 +19,10 @@ import {
   type GatewayCredentials,
   type ITGlueRegion,
 } from "./mcp-server.js";
+import {
+  ITGLUE_BACKEND_TOKEN_HEADER,
+  validateBackendToken,
+} from "./backend-auth.js";
 
 // Re-export the shared factory + IT Glue client/helpers so existing consumers
 // (and tests) that import from the package entry keep working after the
@@ -65,7 +69,7 @@ async function startHttpTransport(): Promise<void> {
   const host = process.env.MCP_HTTP_HOST || "0.0.0.0";
   const isGatewayMode = process.env.AUTH_MODE === "gateway";
 
-  const httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
+  const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse) => {
     const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
 
     // Health endpoint - no auth required
@@ -82,6 +86,13 @@ async function startHttpTransport(): Promise<void> {
       return;
     }
 
+    if (url.pathname === "/ready") {
+      const ready = Boolean(process.env.ITGLUE_BACKEND_TOKEN);
+      res.writeHead(ready ? 200 : 503, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ status: ready ? "ready" : "not_ready" }));
+      return;
+    }
+
     // MCP endpoint — stateless: fresh server + transport per request
     if (url.pathname === "/mcp") {
       // Only POST is supported in stateless mode
@@ -91,6 +102,28 @@ async function startHttpTransport(): Promise<void> {
           jsonrpc: "2.0",
           error: { code: -32000, message: "Method not allowed" },
           id: null,
+        }));
+        return;
+      }
+
+      const headerValue = req.headers[ITGLUE_BACKEND_TOKEN_HEADER];
+      const suppliedBackendToken = Array.isArray(headerValue)
+        ? headerValue[0]
+        : headerValue;
+      const backendAuthFailure = await validateBackendToken(
+        process.env.ITGLUE_BACKEND_TOKEN,
+        suppliedBackendToken
+      );
+      if (backendAuthFailure) {
+        res.writeHead(backendAuthFailure === "not_configured" ? 503 : 401, {
+          "Content-Type": "application/json",
+          "Cache-Control": "no-store",
+        });
+        res.end(JSON.stringify({
+          error:
+            backendAuthFailure === "not_configured"
+              ? "Backend authentication is not configured."
+              : "Backend authentication failed.",
         }));
         return;
       }
@@ -158,7 +191,7 @@ async function startHttpTransport(): Promise<void> {
 
     // 404 for everything else
     res.writeHead(404, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: "Not found", endpoints: ["/mcp", "/health"] }));
+    res.end(JSON.stringify({ error: "Not found", endpoints: ["/mcp", "/health", "/ready"] }));
   });
 
   await new Promise<void>((resolve) => {
