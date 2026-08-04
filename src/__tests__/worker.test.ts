@@ -12,11 +12,16 @@ import worker, { type Env } from "../worker.js";
 const MCP_HEADERS = {
   Accept: "application/json, text/event-stream",
   "Content-Type": "application/json",
+  "X-Summit-ITGlue-Backend-Token": "backend-secret",
+};
+
+const DEFAULT_ENV: Env = {
+  ITGLUE_BACKEND_TOKEN: "backend-secret",
 };
 
 async function mcp(
   body: unknown,
-  env: Env = {},
+  env: Env = DEFAULT_ENV,
   headers: Record<string, string> = {}
 ): Promise<Response> {
   return worker.fetch(
@@ -34,6 +39,53 @@ describe("Cloudflare Worker entrypoint", () => {
     const res = await worker.fetch(new Request("http://worker.local/health"), {});
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ status: "ok" });
+  });
+
+  it("reports readiness only when the backend token is configured", async () => {
+    const notReady = await worker.fetch(
+      new Request("http://worker.local/ready"),
+      {}
+    );
+    expect(notReady.status).toBe(503);
+
+    const ready = await worker.fetch(
+      new Request("http://worker.local/ready"),
+      DEFAULT_ENV
+    );
+    expect(ready.status).toBe(200);
+  });
+
+  it("rejects MCP requests when the backend token is missing", async () => {
+    const res = await mcp(
+      {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {},
+      },
+      { ITGLUE_BACKEND_TOKEN: "" }
+    );
+    expect(res.status).toBe(503);
+  });
+
+  it("rejects MCP requests with an invalid backend token", async () => {
+    const res = await worker.fetch(
+      new Request("http://worker.local/mcp", {
+        method: "POST",
+        headers: {
+          ...MCP_HEADERS,
+          "x-summit-itglue-backend-token": "wrong-token",
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: {},
+        }),
+      }),
+      DEFAULT_ENV
+    );
+    expect(res.status).toBe(401);
   });
 
   it("answers CORS preflight", async () => {
@@ -108,7 +160,7 @@ describe("Cloudflare Worker entrypoint", () => {
         method: "tools/call",
         params: { name: "search_organizations", arguments: {} },
       },
-      { AUTH_MODE: "gateway" }
+      { ...DEFAULT_ENV, AUTH_MODE: "gateway" }
     );
     expect(res.status).toBe(401);
   });

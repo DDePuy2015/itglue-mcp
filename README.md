@@ -50,6 +50,7 @@ The server accepts credentials via environment variables:
 | `ITGLUE_API_KEY` | Your IT Glue API key (format: ITG.xxx) | Yes (env mode) |
 | `ITGLUE_JWT` | A user-session JWT used as an optional **fallback** for document-folder operations on tenants whose API key cannot access the Document Folders resource yet. See [JWT fallback for document-folder operations](#jwt-fallback-for-document-folder-operations). | No |
 | `ITGLUE_REGION` | API region: `us`, `eu`, or `au` (default: `us`) | No |
+| `ITGLUE_BACKEND_TOKEN` | Hosted deployment token required on proxy-to-provider `/mcp` requests | No (HTTP only) |
 | `ITGLUE_BASE_URL` | Override the IT Glue API base URL (advanced) | No |
 | `MCP_TRANSPORT` | Transport: `stdio` (local) or `http` (remote). Defaults to `stdio` when run via `npx`/`node`, and to `http` in the Docker image. | No |
 | `MCP_HTTP_PORT` | Port for HTTP transport (default: `8080`) | No |
@@ -57,6 +58,17 @@ The server accepts credentials via environment variables:
 | `AUTH_MODE` | `env` (read credentials from environment) or `gateway` (read per-request credentials from HTTP headers). Default: `env`. | No |
 
 Alternative: When `AUTH_MODE=gateway`, the MCP Gateway injects credentials per request via HTTP headers instead of environment variables. See [Remote Deployment](#remote-deployment-http-streamable).
+
+Hosted HTTP deployments also require the proxy-only
+`X-Summit-ITGlue-Backend-Token` header on `/mcp`. The token is not used by the
+stdio transport, is never logged, and should be supplied from a secret manager
+rather than an environment literal. The `/health` endpoint remains
+unauthenticated; `/ready` reports whether the backend token is configured.
+
+The proxy injects the backend token and does not forward caller-supplied IT Glue
+credential or backend-token headers. Direct calls to the private provider's
+`/mcp` endpoint therefore fail unless they originate from the configured proxy
+boundary.
 
 ### JWT fallback for document-folder operations
 

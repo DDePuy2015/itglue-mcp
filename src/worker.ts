@@ -32,6 +32,10 @@ import {
   type GatewayCredentials,
   type ITGlueRegion,
 } from "./mcp-server.js";
+import {
+  ITGLUE_BACKEND_TOKEN_HEADER,
+  validateBackendToken,
+} from "./backend-auth.js";
 
 export interface Env {
   ITGLUE_API_KEY?: string;
@@ -39,6 +43,7 @@ export interface Env {
   ITGLUE_JWT?: string;
   ITGLUE_REGION?: string;
   ITGLUE_BASE_URL?: string;
+  ITGLUE_BACKEND_TOKEN?: string;
   AUTH_MODE?: string;
   LOG_LEVEL?: string;
 }
@@ -47,7 +52,7 @@ const CORS_HEADERS: Record<string, string> = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
   "Access-Control-Allow-Headers":
-    "Content-Type, Accept, Authorization, Mcp-Session-Id, MCP-Protocol-Version, X-ITGlue-API-Key, X-API-Key, X-ITGlue-JWT, X-ITGlue-Region, X-ITGlue-Base-URL",
+    "Content-Type, Accept, Authorization, Mcp-Session-Id, MCP-Protocol-Version, X-ITGlue-API-Key, X-API-Key, X-ITGlue-JWT, X-ITGlue-Region, X-ITGlue-Base-URL, X-Summit-ITGlue-Backend-Token",
   "Access-Control-Expose-Headers": "Mcp-Session-Id",
 };
 
@@ -82,7 +87,28 @@ export default {
       return json({ status: "ok" });
     }
 
+    if (url.pathname === "/ready") {
+      const ready = Boolean(env.ITGLUE_BACKEND_TOKEN);
+      return json({ status: ready ? "ready" : "not_ready" }, ready ? 200 : 503);
+    }
+
     if (url.pathname === "/mcp") {
+      const backendAuthFailure = await validateBackendToken(
+        env.ITGLUE_BACKEND_TOKEN,
+        request.headers.get(ITGLUE_BACKEND_TOKEN_HEADER) ?? undefined
+      );
+      if (backendAuthFailure) {
+        return json(
+          {
+            error:
+              backendAuthFailure === "not_configured"
+                ? "Backend authentication is not configured."
+                : "Backend authentication failed.",
+          },
+          backendAuthFailure === "not_configured" ? 503 : 401
+        );
+      }
+
       const isGatewayMode = (env.AUTH_MODE ?? "env") === "gateway";
 
       let credOverrides: GatewayCredentials | undefined;
@@ -142,6 +168,6 @@ export default {
       }
     }
 
-    return json({ error: "Not found", endpoints: ["/mcp", "/health"] }, 404);
+    return json({ error: "Not found", endpoints: ["/mcp", "/health", "/ready"] }, 404);
   },
 };
