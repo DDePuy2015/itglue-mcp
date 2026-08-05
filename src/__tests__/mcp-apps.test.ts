@@ -114,9 +114,11 @@ describe("MCP Apps document card", () => {
       vi.stubEnv("MCP_BRAND_PRIMARY_COLOR", "#ff0000");
       try {
         const { text } = readResource(DOCUMENT_CARD_RESOURCE_URI);
-        expect(text).toContain(
-          '<script>window.__BRAND__={"name":"Acme MSP","primaryColor":"#ff0000"}</script>'
-        );
+        expect(text).toContain('meta name="mcp-brand"');
+        expect(text).toContain(encodeURIComponent(JSON.stringify({
+          name: "Acme MSP",
+          primaryColor: "#ff0000",
+        })));
         expect(text).not.toContain("BRAND_INJECT");
       } finally {
         vi.unstubAllEnvs();
@@ -131,16 +133,22 @@ describe("MCP Apps document card", () => {
   describe("applyBrandInjection", () => {
     const html = DOCUMENT_CARD_HTML;
 
-    it("replaces the marker with an inline window.__BRAND__ script", () => {
+    it("replaces the marker with encoded brand metadata", () => {
       const out = applyBrandInjection(html, { name: "Acme", primaryColor: "#123456" });
-      expect(out).toContain('window.__BRAND__={"name":"Acme","primaryColor":"#123456"}');
+      expect(out).toContain('meta name="mcp-brand"');
+      expect(out).toContain(encodeURIComponent(JSON.stringify({
+        name: "Acme",
+        primaryColor: "#123456",
+      })));
       expect(out).not.toContain("BRAND_INJECT");
     });
 
-    it("escapes < so brand values cannot break out of the script tag", () => {
+    it("encodes hostile values so they cannot become markup", () => {
       const out = applyBrandInjection(html, { name: "</script><script>alert(1)" });
       expect(out).not.toContain("</script><script>alert(1)");
-      expect(out).toContain("\\u003c/script>\\u003cscript>alert(1)");
+      expect(out).toContain(encodeURIComponent(JSON.stringify({
+        name: "</script><script>alert(1)",
+      })));
     });
 
     it("returns the HTML unchanged for an empty brand", () => {

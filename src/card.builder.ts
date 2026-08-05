@@ -41,16 +41,22 @@ export interface CardBrand {
 const BRAND_INJECT_RE = /<!--\s*BRAND_INJECT:[\s\S]*?-->/;
 
 /**
- * Serve-time brand injection: replace the BRAND_INJECT marker with an inline
- * `window.__BRAND__` script so self-hosters can theme the card without
- * rebuilding the bundle. An empty brand returns the HTML unchanged (the card
- * renders its neutral defaults). `<` is escaped so brand values can never
- * break out of the script tag.
+ * Serve-time brand injection: replace the BRAND_INJECT marker with an encoded
+ * metadata value so self-hosters can theme the card without rebuilding the
+ * bundle. An empty brand returns the HTML unchanged (the card renders its
+ * neutral defaults). Encoding keeps brand values out of HTML and JavaScript
+ * syntax contexts.
  */
 export function applyBrandInjection(html: string, brand: CardBrand): string {
-  if (!brand || Object.values(brand).every((v) => !v)) return html;
-  const json = JSON.stringify(brand).replace(/</g, "\\u003c");
-  return html.replace(BRAND_INJECT_RE, `<script>window.__BRAND__=${json}</script>`);
+  const entries = Object.entries(brand ?? {}).filter(
+    ([, value]) => typeof value === "string" && value !== "",
+  );
+  if (entries.length === 0) return html;
+  const encoded = encodeURIComponent(JSON.stringify(Object.fromEntries(entries)));
+  return html.replace(
+    BRAND_INJECT_RE,
+    `<meta name="mcp-brand" content="${encoded}">`,
+  );
 }
 
 /**

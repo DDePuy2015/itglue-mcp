@@ -7,7 +7,7 @@
     <style>
       /* Brand tokens. Defaults are deliberately neutral (system fonts, no
          vendor identity, no external fetches); an MCP server (or a gateway)
-         can override them per-tenant by injecting window.__BRAND__ — see the
+         can override them per-tenant by injecting encoded metadata — see the
          injection marker below (after this style block) and document-card.ts. */
       :root {
         --brand-primary: #2563eb; /* headings, links, status accent */
@@ -116,7 +116,7 @@
       .loading { color: var(--brand-muted); font-style: italic; }
     </style>
     <!-- BRAND_INJECT: a server/gateway replaces this comment with
-         <script>window.__BRAND__={name,logoUrl,primaryColor,accentColor,bg,text}</script>
+         <meta name="mcp-brand" content="encoded JSON">
          to theme the card per-tenant. No injection = neutral defaults above. -->
   </head>
   <body>

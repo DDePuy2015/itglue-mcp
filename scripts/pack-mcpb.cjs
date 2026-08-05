@@ -6,26 +6,113 @@
  * then runs mcpb pack to create the bundle.
  */
 
-const { execSync } = require('child_process');
-const { cpSync, mkdirSync, rmSync, existsSync, copyFileSync } = require('fs');
+const { execFileSync } = require('child_process');
+const {
+  cpSync,
+  mkdirSync,
+  rmSync,
+  existsSync,
+  copyFileSync,
+  readFileSync,
+  writeFileSync,
+  statSync,
+  readdirSync,
+} = require('fs');
 const { resolve, join } = require('path');
 
 const ROOT = resolve(__dirname, '..');
 const STAGING = resolve(ROOT, '.mcpb-staging');
 
-function run(cmd, opts = {}) {
-  console.log(`> ${cmd}`);
-  execSync(cmd, { stdio: 'inherit', ...opts });
+const NPM_CLI = process.env.npm_execpath;
+
+function run(file, args, opts = {}) {
+  console.log(`> ${file} ${args.join(' ')}`);
+  execFileSync(file, args, { stdio: 'inherit', ...opts });
+}
+
+function runNpm(args, opts = {}) {
+  if (NPM_CLI) {
+    run(process.execPath, [NPM_CLI, ...args], opts);
+    return;
+  }
+  if (process.platform === 'win32') {
+    throw new Error('Run pack:mcpb through npm so npm_execpath is available.');
+  }
+  run('npm', args, opts);
+}
+
+function captureNpm(args, opts = {}) {
+  if (NPM_CLI) {
+    return execFileSync(process.execPath, [NPM_CLI, ...args], opts);
+  }
+  if (process.platform === 'win32') {
+    throw new Error('Run pack:mcpb through npm so npm_execpath is available.');
+  }
+  return execFileSync('npm', args, opts);
+}
+
+function runMcpb(args, opts = {}) {
+  const globalRoot = captureNpm(
+    ['root', '--global'],
+    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] },
+  ).trim();
+  const cli = join(globalRoot, '@anthropic-ai', 'mcpb', 'dist', 'cli', 'cli.js');
+  if (!existsSync(cli)) {
+    throw new Error(`Global MCPB CLI not found at ${cli}. Install @anthropic-ai/mcpb first.`);
+  }
+  run(process.execPath, [cli, ...args], opts);
+}
+
+function removeFiles(root, shouldRemove) {
+  if (!existsSync(root)) return;
+  for (const entry of readdirSync(root, { withFileTypes: true })) {
+    const path = join(root, entry.name);
+    if (entry.isDirectory()) {
+      removeFiles(path, shouldRemove);
+    } else if (entry.isFile() && shouldRemove(entry.name)) {
+      rmSync(path, { force: true });
+    }
+  }
+}
+
+const PRUNE_DIRECTORIES = new Set(['test', 'tests', '__tests__', 'examples', 'example']);
+const PRUNE_FILE_PATTERNS = [
+  /\.map$/i,
+  /^CHANGELOG/i,
+  /^HISTORY/i,
+  /^CONTRIBUTING/i,
+  /^\.eslintrc/i,
+  /^\.prettierrc/i,
+  /^tsconfig\.json$/i,
+];
+
+function pruneNodeModules(root) {
+  if (!existsSync(root)) return;
+  for (const entry of readdirSync(root, { withFileTypes: true })) {
+    const path = join(root, entry.name);
+    if (entry.isDirectory()) {
+      if (PRUNE_DIRECTORIES.has(entry.name)) {
+        rmSync(path, { recursive: true, force: true });
+      } else {
+        pruneNodeModules(path);
+      }
+    } else if (
+      entry.isFile() &&
+      PRUNE_FILE_PATTERNS.some((pattern) => pattern.test(entry.name))
+    ) {
+      rmSync(path, { force: true });
+    }
+  }
 }
 
 try {
   // 0. Install dependencies (including devDeps needed for build)
   console.log('\n=== Installing dependencies ===');
-  run('npm ci', { cwd: ROOT });
+  runNpm(['ci'], { cwd: ROOT });
 
   // 1. Build the project
   console.log('\n=== Building project ===');
-  run('npm run build', { cwd: ROOT });
+  runNpm(['run', 'build'], { cwd: ROOT });
 
   // 2. Clean and create staging directory
   console.log('\n=== Preparing staging directory ===');
@@ -34,11 +121,11 @@ try {
 
   // 3. Copy production files (sync manifest version from package.json)
   console.log('\n=== Copying production files ===');
-  const pkg = require(join(ROOT, 'package.json'));
+  const pkg = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'));
   cpSync(join(ROOT, 'dist'), join(STAGING, 'dist'), { recursive: true });
-  const manifest = JSON.parse(require('fs').readFileSync(join(ROOT, 'manifest.json'), 'utf8'));
+  const manifest = JSON.parse(readFileSync(join(ROOT, 'manifest.json'), 'utf8'));
   manifest.version = pkg.version;
-  require('fs').writeFileSync(
+  writeFileSync(
     join(STAGING, 'manifest.json'),
     JSON.stringify(manifest, null, 2) + '\n'
   );
@@ -55,14 +142,17 @@ try {
     main: pkg.main,
     dependencies: pkg.dependencies,
   };
-  require('fs').writeFileSync(
+  writeFileSync(
     join(STAGING, 'package.json'),
     JSON.stringify(prodPkg, null, 2)
   );
 
   // 5. Copy only production dependencies
   console.log('\n=== Copying production dependencies ===');
-  const prodPaths = execSync('npm ls --production --parseable --all 2>/dev/null', { cwd: ROOT, encoding: 'utf8' })
+  const prodPaths = captureNpm(
+    ['ls', '--production', '--parseable', '--all'],
+    { cwd: ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] },
+  )
     .split('\n')
     .filter(p => p.includes('node_modules'))
     .map(p => p.trim());
@@ -77,9 +167,8 @@ try {
   }
 
   // 6. Remove unnecessary files from staging
-  run('find dist -name "*.map" -delete', { cwd: STAGING });
-  run('find node_modules -type d \\( -name test -o -name tests -o -name __tests__ -o -name examples -o -name example \\) -exec rm -rf {} + 2>/dev/null || true', { cwd: STAGING });
-  run('find node_modules -type f \\( -name "*.map" -o -name "CHANGELOG*" -o -name "HISTORY*" -o -name "CONTRIBUTING*" -o -name ".eslintrc*" -o -name ".prettierrc*" -o -name "tsconfig.json" \\) -delete 2>/dev/null || true', { cwd: STAGING });
+  removeFiles(join(STAGING, 'dist'), (name) => name.endsWith('.map'));
+  pruneNodeModules(join(STAGING, 'node_modules'));
 
   // 7. Copy .mcpbignore if present
   if (existsSync(join(ROOT, '.mcpbignore'))) {
@@ -90,7 +179,10 @@ try {
   console.log('\n=== Packing MCPB bundle ===');
   const bundleName = pkg.name.replace(/^@[^/]+\//, '');
   const bundlePath = join(ROOT, `${bundleName}.mcpb`);
-  run(`npx mcpb pack "${STAGING}" "${bundlePath}"`, { cwd: ROOT });
+  // The release workflow installs @anthropic-ai/mcpb globally immediately
+  // before invoking this script. Execute that pinned workflow tool directly;
+  // npm exec would try to resolve a nonexistent unscoped `mcpb` package.
+  runMcpb(['pack', STAGING, bundlePath], { cwd: ROOT });
 
   // 9. Cleanup
   console.log('\n=== Cleanup ===');
@@ -98,7 +190,7 @@ try {
 
   console.log('\n=== Done! ===');
   if (existsSync(bundlePath)) {
-    const stats = require('fs').statSync(bundlePath);
+    const stats = statSync(bundlePath);
     console.log(`Bundle: ${bundleName}.mcpb (${(stats.size / 1024 / 1024).toFixed(1)}MB)`);
   }
 } catch (error) {
