@@ -13,7 +13,7 @@
  * previews are untrusted vendor data, so text only ever lands in text nodes.
  *
  * White-label: the card is neutral by default (no vendor identity) and applies
- * an injected `window.__BRAND__` override (set by the MCP server via
+ * an injected encoded metadata override (set by the MCP server via
  * MCP_BRAND_* env vars, or a gateway per-org) so the same card can render in
  * any operator's brand.
  */
@@ -27,12 +27,6 @@ interface Brand {
   bg?: string;
   text?: string;
 }
-declare global {
-  interface Window {
-    __BRAND__?: Brand;
-  }
-}
-
 /** Mirror of DocumentCard in src/card.builder.ts — keep in sync. */
 interface DocumentCard {
   id: string;
@@ -45,7 +39,24 @@ interface DocumentCard {
   sections: Array<{ heading?: boolean; text: string }>;
 }
 
-const brand: Brand = window.__BRAND__ ?? {};
+function readBrand(): Brand {
+  const encoded = document
+    .querySelector('meta[name="mcp-brand"]')
+    ?.getAttribute("content");
+  if (!encoded) return {};
+
+  try {
+    const parsed: unknown = JSON.parse(decodeURIComponent(encoded));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    return Object.fromEntries(
+      Object.entries(parsed).filter(([, value]) => typeof value === "string"),
+    ) as Brand;
+  } catch {
+    return {};
+  }
+}
+
+const brand = readBrand();
 const brandName = brand.name ?? "";
 
 // Apply any injected brand overrides onto the CSS custom properties.
