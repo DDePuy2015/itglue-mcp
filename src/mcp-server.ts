@@ -77,6 +77,98 @@ function camelToKebab(str: string): string {
   return str.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`);
 }
 
+/** Sort fields /user_metrics accepts, per the IT Glue developer docs. */
+export const USER_METRIC_SORT_FIELDS = [
+  "id",
+  "created",
+  "viewed",
+  "edited",
+  "deleted",
+  "date",
+] as const;
+
+const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
+
+/**
+ * Maximum end-minus-start difference IT Glue accepts on `filter[date]`.
+ *
+ * Verified live 2026-08-06 against api.itglue.com by bisection:
+ *   2026-08-01,2026-08-08  (diff 7) → 200
+ *   2026-08-01,2026-08-09  (diff 8) → 422
+ * So the server compares the *difference*, not the inclusive day count — a
+ * range spanning 8 calendar days is legal. The docs' phrase "longer than a
+ * week" is the difference, and reading it as an inclusive count (7 days) is
+ * off by one in the direction that rejects valid queries.
+ */
+const USER_METRICS_MAX_RANGE_DIFF_DAYS = 7;
+
+/**
+ * Build the `filter[date]` value for /user_metrics, or return an error string.
+ *
+ * IT Glue expects `start,end` with `*` for an open boundary. Two rules are
+ * enforced here rather than left to the API, both verified live 2026-08-06:
+ *
+ *  1. **Range cap.** A difference over 7 days returns 422 with the title
+ *     "date range filter cannot be longer than a week, and cannot start with
+ *     a wildcard" — one message for two distinct faults, so it cannot tell a
+ *     caller which one they hit. We say which.
+ *
+ *  2. **No open start.** `*,2026-08-07` is rejected outright (422); only the
+ *     END may be a wildcard. `2026-08-01,*` and the degenerate `*,*` both
+ *     return 200. So an `end_date` without a `start_date` is not a narrower
+ *     query — it is a guaranteed error, and we refuse it before the call.
+ *
+ * Returns null when neither bound is supplied, so the caller omits the filter
+ * and lets IT Glue apply its own default window.
+ */
+export function buildUserMetricsDateFilter(
+  startDate?: string,
+  endDate?: string
+): { value: string | null } | { error: string } {
+  for (const [label, value] of [
+    ["start_date", startDate],
+    ["end_date", endDate],
+  ] as const) {
+    if (value !== undefined && !ISO_DATE.test(value)) {
+      return { error: `${label} must be in YYYY-MM-DD format (got "${value}")` };
+    }
+  }
+
+  if (!startDate && !endDate) return { value: null };
+
+  if (!startDate && endDate) {
+    return {
+      error:
+        `end_date requires a start_date. IT Glue rejects a date filter that begins with a ` +
+        `wildcard ("*,${endDate}" → 422), so an open start is not a valid narrowing — ` +
+        `supply start_date, or omit both to use the default window.`,
+    };
+  }
+
+  if (startDate && endDate) {
+    const start = Date.parse(`${startDate}T00:00:00Z`);
+    const end = Date.parse(`${endDate}T00:00:00Z`);
+    if (Number.isNaN(start) || Number.isNaN(end)) {
+      return { error: "start_date and end_date must be valid calendar dates" };
+    }
+    if (end < start) {
+      return { error: `end_date (${endDate}) is before start_date (${startDate})` };
+    }
+    const diffDays = Math.round((end - start) / 86_400_000);
+    if (diffDays > USER_METRICS_MAX_RANGE_DIFF_DAYS) {
+      return {
+        error:
+          `Date range spans ${diffDays} days end-to-start; IT Glue allows at most ` +
+          `${USER_METRICS_MAX_RANGE_DIFF_DAYS} (so ${startDate} through ` +
+          `${new Date(start + USER_METRICS_MAX_RANGE_DIFF_DAYS * 86_400_000).toISOString().slice(0, 10)} ` +
+          `is the widest window from this start). Narrow the range and page through it.`,
+      };
+    }
+  }
+
+  return { value: `${startDate},${endDate ?? "*"}` };
+}
+
 function convertKeysToCamel(obj: Record<string, unknown>): Record<string, unknown> {
   const result: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(obj)) {
@@ -1456,6 +1548,56 @@ export function createMcpServer(credentialOverrides?: GatewayCredentials): Serve
         },
       },
       ...flexibleAssetToolDefinitions(),
+      // User metrics
+      {
+        name: "search_user_metrics",
+        description:
+          "Search IT Glue user activity metrics — per-user, per-organization, per-resource-type " +
+          "counts of created/viewed/edited/deleted actions, bucketed by date. This is the raw data " +
+          "behind IT Glue's user reputation scores. The date range may span at most 7 days " +
+          "end-to-start; end_date requires a start_date (IT Glue rejects an open start).",
+        inputSchema: {
+          type: "object",
+          properties: {
+            user_id: {
+              type: "number",
+              description: "Filter by IT Glue user ID",
+            },
+            organization_id: {
+              type: "number",
+              description: "Filter by organization ID",
+            },
+            resource_type: {
+              type: "string",
+              description:
+                "Filter by resource type the activity was against (e.g. Configuration, Password, Document, FlexibleAsset)",
+            },
+            start_date: {
+              type: "string",
+              description:
+                "Start of the UTC date range, YYYY-MM-DD. Omit for an open start. The range may not exceed 7 days.",
+            },
+            end_date: {
+              type: "string",
+              description:
+                "End of the UTC date range, YYYY-MM-DD. Omit for an open end. The range may not exceed 7 days.",
+            },
+            sort: {
+              type: "string",
+              description:
+                "Sort field: id, created, viewed, edited, deleted, or date. Prefix with - for descending.",
+            },
+            page_size: {
+              type: "number",
+              description: "Number of results per page (max 1000, default 50)",
+            },
+            page_number: {
+              type: "number",
+              description: "Page number (default 1)",
+            },
+          },
+        },
+      },
       // Health check
       {
         name: "itglue_health_check",
@@ -2397,6 +2539,61 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             {
               type: "text",
               text: JSON.stringify(redactedResult, null, 2),
+            },
+          ],
+        };
+      }
+
+      case "search_user_metrics": {
+        const dateFilter = buildUserMetricsDateFilter(
+          args?.start_date as string | undefined,
+          args?.end_date as string | undefined
+        );
+        if ("error" in dateFilter) {
+          return {
+            content: [{ type: "text", text: `Error: ${dateFilter.error}` }],
+            isError: true,
+          };
+        }
+
+        if (args?.sort) {
+          const field = String(args.sort).replace(/^-/, "");
+          if (!(USER_METRIC_SORT_FIELDS as readonly string[]).includes(field)) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text:
+                    `Error: sort must be one of ${USER_METRIC_SORT_FIELDS.join(", ")} ` +
+                    `(optionally prefixed with - for descending); got "${args.sort}"`,
+                },
+              ],
+              isError: true,
+            };
+          }
+        }
+
+        const params: Record<string, unknown> = {};
+        const filter: Record<string, unknown> = {};
+
+        if (args?.user_id) filter.userId = args.user_id;
+        if (args?.organization_id) filter.organizationId = args.organization_id;
+        if (args?.resource_type) filter.resourceType = args.resource_type;
+        if (dateFilter.value !== null) filter.date = dateFilter.value;
+
+        if (Object.keys(filter).length > 0) params.filter = filter;
+        if (args?.sort) params.sort = args.sort;
+        params.page = {
+          size: (args?.page_size as number) || 50,
+          number: (args?.page_number as number) || 1,
+        };
+
+        const result = await client.request("/user_metrics", params);
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(result, null, 2),
             },
           ],
         };
