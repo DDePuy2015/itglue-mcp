@@ -24,6 +24,9 @@ import {
   validateBackendToken,
 } from "./backend-auth.js";
 import { runWithServerRef, bindServerRef } from "./utils/server-ref.js";
+import { verifyS2sHeader, S2S_HEADER } from "./s2s-verify.js";
+
+const S2S_SECRET = process.env.CONDUIT_S2S_SECRET || "";
 
 // Re-export the shared factory + IT Glue client/helpers so existing consumers
 // (and tests) that import from the package entry keep working after the
@@ -100,6 +103,16 @@ async function startHttpTransport(): Promise<void> {
 
     // MCP endpoint — stateless: fresh server + transport per request
     if (url.pathname === "/mcp") {
+      if (S2S_SECRET && !verifyS2sHeader(req.headers[S2S_HEADER] as string | undefined, S2S_SECRET)) {
+        res.writeHead(401, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            error: "Missing or invalid X-Gateway-S2S header: this endpoint only accepts requests signed by the gateway.",
+          })
+        );
+        return;
+      }
+
       // Only POST is supported in stateless mode
       if (req.method !== "POST") {
         res.writeHead(405, { "Content-Type": "application/json" });
