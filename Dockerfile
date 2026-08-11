@@ -11,6 +11,8 @@ RUN npm ci
 # Copy source and build
 COPY . .
 RUN npm run build
+# Keep the runtime image limited to production dependencies.
+RUN npm prune --omit=dev --ignore-scripts
 
 FROM node:26-alpine AS runner
 
