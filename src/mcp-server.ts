@@ -2599,6 +2599,61 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
 
+      case "search_user_metrics": {
+        const dateFilter = buildUserMetricsDateFilter(
+          args?.start_date as string | undefined,
+          args?.end_date as string | undefined
+        );
+        if ("error" in dateFilter) {
+          return {
+            content: [{ type: "text", text: `Error: ${dateFilter.error}` }],
+            isError: true,
+          };
+        }
+
+        if (args?.sort) {
+          const field = String(args.sort).replace(/^-/, "");
+          if (!(USER_METRIC_SORT_FIELDS as readonly string[]).includes(field)) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text:
+                    `Error: sort must be one of ${USER_METRIC_SORT_FIELDS.join(", ")} ` +
+                    `(optionally prefixed with - for descending); got "${args.sort}"`,
+                },
+              ],
+              isError: true,
+            };
+          }
+        }
+
+        const params: Record<string, unknown> = {};
+        const filter: Record<string, unknown> = {};
+
+        if (args?.user_id) filter.userId = args.user_id;
+        if (args?.organization_id) filter.organizationId = args.organization_id;
+        if (args?.resource_type) filter.resourceType = args.resource_type;
+        if (dateFilter.value !== null) filter.date = dateFilter.value;
+
+        if (Object.keys(filter).length > 0) params.filter = filter;
+        if (args?.sort) params.sort = args.sort;
+        params.page = {
+          size: (args?.page_size as number) || 50,
+          number: (args?.page_number as number) || 1,
+        };
+
+        const result = await client.request("/user_metrics", params);
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(result, null, 2),
+            },
+          ],
+        };
+      }
+
       // Health check
       case "itglue_health_check": {
         const result = await client.request("/organization_types", { page: { size: 1 } });
