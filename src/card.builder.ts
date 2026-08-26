@@ -11,6 +11,7 @@
  */
 
 import type { ITGlueClient } from "./mcp-server.js";
+import { isApiErrorStatus } from "./errors.js";
 
 export const DOCUMENT_CARD_RESOURCE_URI = "ui://itglue/document-card.html";
 
@@ -191,8 +192,17 @@ export async function buildDocumentCard(
         .filter((s): s is DocumentCard["sections"][number] => s !== null)
         .slice(0, CARD_SECTION_LIMIT);
     }
-  } catch {
-    // Best-effort: render the card without a preview rather than failing the tool.
+  } catch (err) {
+    // Best-effort: render the card without a preview rather than failing the
+    // tool. A 404 is routine (documents without sections, tenants without the
+    // endpoint); anything else is logged so a systematically broken preview is
+    // visible in the server log instead of looking like empty documents.
+    if (!isApiErrorStatus(err, 404)) {
+      console.error(
+        `[itglue-mcp] Document card preview unavailable for document ${card.id}; ` +
+          `rendering card without it: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
   }
 
   return card;

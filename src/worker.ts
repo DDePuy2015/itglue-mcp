@@ -37,6 +37,7 @@ import {
   validateBackendToken,
 } from "./backend-auth.js";
 import { runWithServerRef } from "./utils/server-ref.js";
+import { closeQuietly } from "./utils/close.js";
 
 export interface Env {
   ITGLUE_API_KEY?: string;
@@ -164,14 +165,26 @@ export default {
       });
 
       return runWithServerRef(server, async () => {
-        await server.connect(transport);
-
         try {
+          // connect() is inside the try so a failure there is still answered
+          // with a JSON-RPC error (and still tears the server down) instead of
+          // escaping fetch() as an opaque, CORS-less Workers 500.
+          await server.connect(transport);
           const response = await transport.handleRequest(request);
           return withCors(response);
+        } catch (err) {
+          console.error("MCP transport error:", err);
+          return json(
+            {
+              jsonrpc: "2.0",
+              error: { code: -32603, message: "Internal error" },
+              id: null,
+            },
+            500
+          );
         } finally {
-          await transport.close();
-          await server.close();
+          // Teardown must not replace the response with a throw of its own.
+          await closeQuietly(transport, server);
         }
       });
     }
