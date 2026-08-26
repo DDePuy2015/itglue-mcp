@@ -10,7 +10,7 @@
  * `worker.ts`). This file owns the Node-only transports (stdio + Node HTTP).
  */
 
-import { createServer, IncomingMessage, ServerResponse } from "node:http";
+import { createServer, IncomingMessage, ServerResponse, Server as NodeHttpServer } from "node:http";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
@@ -72,9 +72,11 @@ async function startStdioTransport(): Promise<void> {
 
 /**
  * Start with HTTP Streamable transport (for Docker/cloud deployment)
- * Supports both env-based and gateway (header-based) credential modes
+ * Supports both env-based and gateway (header-based) credential modes.
+ * Returns the underlying Node HTTP server (used by tests to bind an
+ * ephemeral port and shut the listener down).
  */
-async function startHttpTransport(): Promise<void> {
+export async function startHttpTransport(): Promise<NodeHttpServer> {
   const port = parseInt(process.env.MCP_HTTP_PORT || "8080", 10);
   const host = process.env.MCP_HTTP_HOST || "0.0.0.0";
   const isGatewayMode = process.env.AUTH_MODE === "gateway";
@@ -244,6 +246,8 @@ async function startHttpTransport(): Promise<void> {
 
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
+
+  return httpServer;
 }
 
 // Start the server
