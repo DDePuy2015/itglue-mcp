@@ -16,6 +16,30 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { elicitSelection, elicitText } from "./utils/elicitation.js";
+import {
+  buildFilterParams,
+  deserializeResource,
+  paginationMeta,
+  type JsonApiResponse,
+  type PaginationMeta,
+} from "./utils/json-api.js";
+import {
+  errorMessage,
+  errorResult,
+  requireArgs,
+  textResult,
+  type ToolResult,
+} from "./utils/tool-result.js";
+import {
+  PAGINATION_PROPERTIES,
+  pageParams,
+  sortProperty,
+} from "./utils/pagination.js";
+import {
+  attributesFromArgs,
+  filterFromArgs,
+  searchParams,
+} from "./utils/query.js";
 import { registerPromptHandlers } from "./prompts.js";
 import { registerResourceHandlers } from "./resources.js";
 import { buildDocumentCard, DOCUMENT_CARD_META } from "./card.builder.js";
@@ -35,48 +59,6 @@ const REGION_URLS: Record<ITGlueRegion, string> = {
   au: "https://api.au.itglue.com",
 };
 
-// JSON:API types
-interface JsonApiResource {
-  id: string;
-  type: string;
-  attributes?: Record<string, unknown>;
-  relationships?: Record<string, { data: unknown }>;
-}
-
-interface JsonApiResponse {
-  data: JsonApiResource | JsonApiResource[];
-  meta?: {
-    "current-page"?: number;
-    "next-page"?: number | null;
-    "prev-page"?: number | null;
-    "total-pages"?: number;
-    "total-count"?: number;
-  };
-  included?: JsonApiResource[];
-  errors?: Array<{
-    title?: string;
-    detail?: string;
-    status?: string;
-  }>;
-}
-
-interface PaginationMeta {
-  currentPage: number;
-  nextPage: number | null;
-  prevPage: number | null;
-  totalPages: number;
-  totalCount: number;
-}
-
-// Utility functions for JSON:API
-function kebabToCamel(str: string): string {
-  return str.replace(/-([a-z])/g, (_, letter) => letter.toUpperCase());
-}
-
-function camelToKebab(str: string): string {
-  return str.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`);
-}
-
 /** Sort fields /user_metrics accepts, per the IT Glue developer docs. */
 export const USER_METRIC_SORT_FIELDS = [
   "id",
@@ -88,6 +70,24 @@ export const USER_METRIC_SORT_FIELDS = [
 ] as const;
 
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
+
+/**
+ * Location attributes IT Glue accepts on write, shared by create/update.
+ * `name` is required on create and optional on update, so it is added by the
+ * handlers rather than listed here.
+ */
+const LOCATION_WRITABLE_FIELDS = [
+  "country_id",
+  "region_id",
+  "address_1",
+  "address_2",
+  "city",
+  "postal_code",
+  "phone",
+  "fax",
+  "notes",
+  "primary",
+] as const;
 
 /**
  * Maximum end-minus-start difference IT Glue accepts on `filter[date]`.
@@ -169,54 +169,12 @@ export function buildUserMetricsDateFilter(
   return { value: `${startDate},${endDate ?? "*"}` };
 }
 
-function convertKeysToCamel(obj: Record<string, unknown>): Record<string, unknown> {
-  const result: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(obj)) {
-    const camelKey = kebabToCamel(key);
-    if (value && typeof value === "object" && !Array.isArray(value)) {
-      result[camelKey] = convertKeysToCamel(value as Record<string, unknown>);
-    } else {
-      result[camelKey] = value;
-    }
-  }
-  return result;
-}
-
-function deserializeResource(resource: JsonApiResource): Record<string, unknown> {
-  const result: Record<string, unknown> = {
-    id: resource.id,
-    type: resource.type,
-  };
-  if (resource.attributes) {
-    Object.assign(result, convertKeysToCamel(resource.attributes));
-  }
-  return result;
-}
-
-function buildFilterParams(filter: Record<string, unknown>): Record<string, string> {
-  const result: Record<string, string> = {};
-  for (const [key, value] of Object.entries(filter)) {
-    if (value === undefined || value === null) continue;
-    const kebabKey = camelToKebab(key);
-    if (typeof value === "object" && !Array.isArray(value)) {
-      // JSON:API filter operator form, e.g. { ne: "" } → filter[key][ne]=
-      for (const [op, opValue] of Object.entries(value as Record<string, unknown>)) {
-        result[`${kebabKey}][${op}`] = String(opValue ?? "");
-      }
-    } else {
-      result[kebabKey] = String(value);
-    }
-  }
-  return result;
-}
-
 /**
  * Extract the HTTP status from an ITGlueClient error message
  * ("IT Glue API error (404): ..."), or null for non-HTTP errors.
  */
 function apiErrorStatus(err: unknown): number | null {
-  const msg = err instanceof Error ? err.message : String(err);
-  const match = msg.match(/IT Glue API error \((\d{3})\)/);
+  const match = errorMessage(err).match(/IT Glue API error \((\d{3})\)/);
   return match ? Number(match[1]) : null;
 }
 
@@ -292,25 +250,35 @@ export class ITGlueClient {
     return queryString ? `?${queryString}` : "";
   }
 
-  async request<T>(
+  /**
+   * Single outbound path for every verb: auth + JSON:API headers, HTTP status
+   * check, and the JSON:API `errors` array check (IT Glue can return 200 with
+   * an errors payload). Returns the parsed document, or null for a 204-style
+   * DELETE that carries no body.
+   */
+  private async send(
+    method: "GET" | "POST" | "PATCH" | "DELETE",
     path: string,
-    params: Record<string, unknown> = {}
-  ): Promise<{ data: T[]; meta: PaginationMeta }> {
-    const url = `${this.baseUrl}${path}${this.buildQueryString(params)}`;
-
-    const response = await fetch(url, {
-      method: "GET",
+    options: { query?: string; body?: string; contentType?: boolean } = {}
+  ): Promise<JsonApiResponse | null> {
+    const response = await fetch(`${this.baseUrl}${path}${options.query ?? ""}`, {
+      method,
       headers: {
         ...this.authHeaders(),
-        "Content-Type": "application/vnd.api+json",
+        ...(options.contentType === false
+          ? {}
+          : { "Content-Type": "application/vnd.api+json" }),
         Accept: "application/vnd.api+json",
       },
+      ...(options.body !== undefined ? { body: options.body } : {}),
     });
 
     if (!response.ok) {
       const errorBody = await response.text();
       throw new Error(`IT Glue API error (${response.status}): ${errorBody}`);
     }
+
+    if (method === "DELETE") return null;
 
     const json = (await response.json()) as JsonApiResponse;
 
@@ -319,19 +287,39 @@ export class ITGlueClient {
       throw new Error(`IT Glue API error: ${errorMessages}`);
     }
 
+    return json;
+  }
+
+  /** Write verbs answer with a single resource; return it deserialized. */
+  private async write<T>(
+    method: "POST" | "PATCH",
+    path: string,
+    body: Record<string, unknown>,
+    omitEmptyBody = false
+  ): Promise<T> {
+    const json = (await this.send(method, path, {
+      body:
+        omitEmptyBody && Object.keys(body).length === 0
+          ? undefined
+          : JSON.stringify(body),
+    })) as JsonApiResponse;
+    const resource = Array.isArray(json.data) ? json.data[0] : json.data;
+    return deserializeResource(resource) as T;
+  }
+
+  async request<T>(
+    path: string,
+    params: Record<string, unknown> = {}
+  ): Promise<{ data: T[]; meta: PaginationMeta }> {
+    const json = (await this.send("GET", path, {
+      query: this.buildQueryString(params),
+    })) as JsonApiResponse;
+
     const data = Array.isArray(json.data)
       ? json.data.map(deserializeResource)
       : [deserializeResource(json.data)];
 
-    const meta: PaginationMeta = {
-      currentPage: json.meta?.["current-page"] || 1,
-      nextPage: json.meta?.["next-page"] || null,
-      prevPage: json.meta?.["prev-page"] || null,
-      totalPages: json.meta?.["total-pages"] || 1,
-      totalCount: json.meta?.["total-count"] || data.length,
-    };
-
-    return { data: data as T[], meta };
+    return { data: data as T[], meta: paginationMeta(json, data.length) };
   }
 
   async get<T>(path: string, params: Record<string, unknown> = {}): Promise<T> {
@@ -340,78 +328,15 @@ export class ITGlueClient {
   }
 
   async post<T>(path: string, body: Record<string, unknown>): Promise<T> {
-    const url = `${this.baseUrl}${path}`;
-
-    const response = await fetch(url, {
-      method: "POST",
-      headers: {
-        ...this.authHeaders(),
-        "Content-Type": "application/vnd.api+json",
-        Accept: "application/vnd.api+json",
-      },
-      body: JSON.stringify(body),
-    });
-
-    if (!response.ok) {
-      const errorBody = await response.text();
-      throw new Error(`IT Glue API error (${response.status}): ${errorBody}`);
-    }
-
-    const json = (await response.json()) as JsonApiResponse;
-
-    if (json.errors && json.errors.length > 0) {
-      const errorMessages = json.errors.map((e) => e.detail || e.title).join(", ");
-      throw new Error(`IT Glue API error: ${errorMessages}`);
-    }
-
-    const resource = Array.isArray(json.data) ? json.data[0] : json.data;
-    return deserializeResource(resource) as T;
+    return this.write<T>("POST", path, body);
   }
 
   async patch<T>(path: string, body: Record<string, unknown> = {}): Promise<T> {
-    const url = `${this.baseUrl}${path}`;
-
-    const response = await fetch(url, {
-      method: "PATCH",
-      headers: {
-        ...this.authHeaders(),
-        "Content-Type": "application/vnd.api+json",
-        Accept: "application/vnd.api+json",
-      },
-      body: Object.keys(body).length > 0 ? JSON.stringify(body) : undefined,
-    });
-
-    if (!response.ok) {
-      const errorBody = await response.text();
-      throw new Error(`IT Glue API error (${response.status}): ${errorBody}`);
-    }
-
-    const json = (await response.json()) as JsonApiResponse;
-
-    if (json.errors && json.errors.length > 0) {
-      const errorMessages = json.errors.map((e) => e.detail || e.title).join(", ");
-      throw new Error(`IT Glue API error: ${errorMessages}`);
-    }
-
-    const resource = Array.isArray(json.data) ? json.data[0] : json.data;
-    return deserializeResource(resource) as T;
+    return this.write<T>("PATCH", path, body, true);
   }
 
   async delete(path: string): Promise<void> {
-    const url = `${this.baseUrl}${path}`;
-
-    const response = await fetch(url, {
-      method: "DELETE",
-      headers: {
-        ...this.authHeaders(),
-        Accept: "application/vnd.api+json",
-      },
-    });
-
-    if (!response.ok) {
-      const errorBody = await response.text();
-      throw new Error(`IT Glue API error (${response.status}): ${errorBody}`);
-    }
+    await this.send("DELETE", path, { contentType: false });
   }
 }
 
@@ -895,18 +820,8 @@ export function createMcpServer(credentialOverrides?: GatewayCredentials): Serve
               type: "string",
               description: "Filter by PSA integration ID",
             },
-            page_size: {
-              type: "number",
-              description: "Number of results per page (max 1000, default 50)",
-            },
-            page_number: {
-              type: "number",
-              description: "Page number to retrieve (default 1)",
-            },
-            sort: {
-              type: "string",
-              description: "Sort field (prefix with - for descending, e.g., '-name')",
-            },
+            ...PAGINATION_PROPERTIES,
+            sort: sortProperty("Sort field (prefix with - for descending, e.g., '-name')"),
           },
           required: [],
         },
@@ -960,18 +875,8 @@ export function createMcpServer(credentialOverrides?: GatewayCredentials): Serve
               type: "string",
               description: "Filter by PSA integration ID",
             },
-            page_size: {
-              type: "number",
-              description: "Number of results per page (max 1000, default 50)",
-            },
-            page_number: {
-              type: "number",
-              description: "Page number to retrieve (default 1)",
-            },
-            sort: {
-              type: "string",
-              description: "Sort field (prefix with - for descending)",
-            },
+            ...PAGINATION_PROPERTIES,
+            sort: sortProperty(),
           },
           required: [],
         },
@@ -1025,18 +930,8 @@ export function createMcpServer(credentialOverrides?: GatewayCredentials): Serve
               type: "string",
               description: "Filter by PSA integration ID",
             },
-            page_size: {
-              type: "number",
-              description: "Number of results per page (max 1000, default 50)",
-            },
-            page_number: {
-              type: "number",
-              description: "Page number to retrieve (default 1)",
-            },
-            sort: {
-              type: "string",
-              description: "Sort field (prefix with - for descending, e.g., '-name')",
-            },
+            ...PAGINATION_PROPERTIES,
+            sort: sortProperty("Sort field (prefix with - for descending, e.g., '-name')"),
           },
           required: [],
         },
@@ -1204,18 +1099,8 @@ export function createMcpServer(credentialOverrides?: GatewayCredentials): Serve
               type: "string",
               description: "Filter by username",
             },
-            page_size: {
-              type: "number",
-              description: "Number of results per page (max 1000, default 50)",
-            },
-            page_number: {
-              type: "number",
-              description: "Page number to retrieve (default 1)",
-            },
-            sort: {
-              type: "string",
-              description: "Sort field (prefix with - for descending)",
-            },
+            ...PAGINATION_PROPERTIES,
+            sort: sortProperty(),
           },
           required: [],
         },
@@ -1253,18 +1138,8 @@ export function createMcpServer(credentialOverrides?: GatewayCredentials): Serve
               type: "string",
               description: "Filter by document name (partial match)",
             },
-            page_size: {
-              type: "number",
-              description: "Number of results per page (max 1000, default 50)",
-            },
-            page_number: {
-              type: "number",
-              description: "Page number to retrieve (default 1)",
-            },
-            sort: {
-              type: "string",
-              description: "Sort field (prefix with - for descending)",
-            },
+            ...PAGINATION_PROPERTIES,
+            sort: sortProperty(),
             document_folder_id: {
               type: "number",
               description: "Filter by document folder ID to search within a specific folder",
@@ -1306,14 +1181,7 @@ export function createMcpServer(credentialOverrides?: GatewayCredentials): Serve
               type: "string",
               description: "Optional name filter (partial match)",
             },
-            page_size: {
-              type: "number",
-              description: "Number of results per page (max 1000, default 50)",
-            },
-            page_number: {
-              type: "number",
-              description: "Page number to retrieve (default 1)",
-            },
+            ...PAGINATION_PROPERTIES,
           },
           required: ["organization_id"],
         },
@@ -1531,18 +1399,8 @@ export function createMcpServer(credentialOverrides?: GatewayCredentials): Serve
               type: "string",
               description: "Filter by flexible asset name (partial match)",
             },
-            page_size: {
-              type: "number",
-              description: "Number of results per page (max 1000, default 50)",
-            },
-            page_number: {
-              type: "number",
-              description: "Page number to retrieve (default 1)",
-            },
-            sort: {
-              type: "string",
-              description: "Sort field (prefix with - for descending)",
-            },
+            ...PAGINATION_PROPERTIES,
+            sort: sortProperty(),
           },
           required: ["flexible_asset_type_id"],
         },
@@ -1678,6 +1536,39 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     return createClient({ ...effectiveCredentials, apiKey: undefined, jwt });
   };
 
+  /**
+   * Resolve the organization the caller meant when they omitted
+   * `organization_id`: elicit a name and look it up. Returns the id, nothing
+   * when it stayed unresolved, or a `result` listing the candidates for the
+   * model to disambiguate when the name matched several organizations.
+   */
+  const resolveOrganizationId = async (
+    client: ITGlueClient,
+    prompt: string
+  ): Promise<{ id?: number; result?: ToolResult }> => {
+    const orgSearch = await elicitText(
+      prompt,
+      "organization",
+      "Enter an organization name to search for"
+    );
+    if (!orgSearch) return {};
+
+    const orgResult = await client.request("/organizations", {
+      filter: { name: orgSearch },
+      page: { size: 5, number: 1 },
+    });
+    const orgs = orgResult.data as Array<Record<string, unknown>>;
+    if (orgs.length === 1) return { id: Number(orgs[0].id) };
+    if (orgs.length > 1) {
+      return {
+        result: textResult(
+          `Multiple organizations match "${orgSearch}". Please re-run with a specific organization_id:\n\n${JSON.stringify(orgs.map((o) => ({ id: o.id, name: o.name })), null, 2)}`
+        ),
+      };
+    }
+    return {};
+  };
+
   try {
     const client = createClient(effectiveCredentials);
 
@@ -1691,9 +1582,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     switch (name) {
       // Organizations
       case "search_organizations": {
-        const params: Record<string, unknown> = {};
-        const filter: Record<string, unknown> = {};
-
         // If no search term provided, elicit one from the user
         let orgName = args?.name as string | undefined;
         if (!orgName && !args?.organization_type_id && !args?.organization_status_id && !args?.psa_id) {
@@ -1707,373 +1595,165 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }
         }
 
-        if (orgName) filter.name = orgName;
-        if (args?.organization_type_id) filter.organizationTypeId = args.organization_type_id;
-        if (args?.organization_status_id) filter.organizationStatusId = args.organization_status_id;
-        if (args?.psa_id) filter.psaId = args.psa_id;
-
-        if (Object.keys(filter).length > 0) params.filter = filter;
-        if (args?.sort) params.sort = args.sort;
-        params.page = {
-          size: (args?.page_size as number) || 50,
-          number: (args?.page_number as number) || 1,
-        };
+        const params = searchParams(
+          args,
+          ["organization_type_id", "organization_status_id", "psa_id"],
+          orgName ? { name: orgName } : {}
+        );
 
         const result = await client.request("/organizations", params);
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(result, null, 2),
-            },
-          ],
-        };
+        return textResult(result);
       }
 
       case "get_organization": {
         if (!args?.id) {
-          return {
-            content: [{ type: "text", text: "Error: Organization ID is required" }],
-            isError: true,
-          };
+          return errorResult("Organization ID is required");
         }
         const org = await client.get(`/organizations/${args.id}`);
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(org, null, 2),
-            },
-          ],
-        };
+        return textResult(org);
       }
 
       // Configurations
       case "search_configurations": {
-        const params: Record<string, unknown> = {};
-        const filter: Record<string, unknown> = {};
-
         let configOrgId = args?.organization_id as number | undefined;
-
-        // If no organization_id, elicit an organization name search to find it
         if (!configOrgId) {
-          const orgSearch = await elicitText(
-            "Configurations are easier to find when scoped to an organization. Which organization?",
-            "organization",
-            "Enter an organization name to search for"
+          const resolved = await resolveOrganizationId(
+            client,
+            "Configurations are easier to find when scoped to an organization. Which organization?"
           );
-          if (orgSearch) {
-            // Search for the organization to get its ID
-            const orgResult = await client.request("/organizations", {
-              filter: { name: orgSearch },
-              page: { size: 5, number: 1 },
-            });
-            const orgs = orgResult.data as Array<Record<string, unknown>>;
-            if (orgs.length === 1) {
-              configOrgId = Number(orgs[0].id);
-            } else if (orgs.length > 1) {
-              // Return the org list so the LLM can ask the user to pick
-              return {
-                content: [
-                  {
-                    type: "text",
-                    text: `Multiple organizations match "${orgSearch}". Please re-run with a specific organization_id:\n\n${JSON.stringify(orgs.map((o) => ({ id: o.id, name: o.name })), null, 2)}`,
-                  },
-                ],
-              };
-            }
-          }
+          if (resolved.result) return resolved.result;
+          configOrgId = resolved.id;
         }
 
-        if (configOrgId) filter.organizationId = configOrgId;
-        if (args?.name) filter.name = args.name;
-        if (args?.configuration_type_id) filter.configurationTypeId = args.configuration_type_id;
-        if (args?.configuration_status_id) filter.configurationStatusId = args.configuration_status_id;
-        if (args?.serial_number) filter.serialNumber = args.serial_number;
-        if (args?.rmm_id) filter.rmmId = args.rmm_id;
-        if (args?.psa_id) filter.psaId = args.psa_id;
-
-        if (Object.keys(filter).length > 0) params.filter = filter;
-        if (args?.sort) params.sort = args.sort;
-        params.page = {
-          size: (args?.page_size as number) || 50,
-          number: (args?.page_number as number) || 1,
-        };
+        const params = searchParams(
+          args,
+          [
+            "name",
+            "configuration_type_id",
+            "configuration_status_id",
+            "serial_number",
+            "rmm_id",
+            "psa_id",
+          ],
+          configOrgId ? { organizationId: configOrgId } : {}
+        );
 
         const result = await client.request("/configurations", params);
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(result, null, 2),
-            },
-          ],
-        };
+        return textResult(result);
       }
 
       case "get_configuration": {
         if (!args?.id) {
-          return {
-            content: [{ type: "text", text: "Error: Configuration ID is required" }],
-            isError: true,
-          };
+          return errorResult("Configuration ID is required");
         }
         const config = await client.get(`/configurations/${args.id}`);
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(config, null, 2),
-            },
-          ],
-        };
+        return textResult(config);
       }
 
       // Locations
       case "search_locations": {
-        const params: Record<string, unknown> = {};
-        const filter: Record<string, unknown> = {};
-
         let locOrgId = args?.organization_id as number | undefined;
-
-        // If no organization_id, elicit an organization name search to find it
-        // (mirrors search_configurations / search_passwords).
         if (!locOrgId) {
-          const orgSearch = await elicitText(
-            "Locations are easier to find when scoped to an organization. Which organization?",
-            "organization",
-            "Enter an organization name to search for"
+          const resolved = await resolveOrganizationId(
+            client,
+            "Locations are easier to find when scoped to an organization. Which organization?"
           );
-          if (orgSearch) {
-            const orgResult = await client.request("/organizations", {
-              filter: { name: orgSearch },
-              page: { size: 5, number: 1 },
-            });
-            const orgs = orgResult.data as Array<Record<string, unknown>>;
-            if (orgs.length === 1) {
-              locOrgId = Number(orgs[0].id);
-            } else if (orgs.length > 1) {
-              return {
-                content: [
-                  {
-                    type: "text",
-                    text: `Multiple organizations match "${orgSearch}". Please re-run with a specific organization_id:\n\n${JSON.stringify(orgs.map((o) => ({ id: o.id, name: o.name })), null, 2)}`,
-                  },
-                ],
-              };
-            }
-          }
+          if (resolved.result) return resolved.result;
+          locOrgId = resolved.id;
         }
 
-        if (locOrgId) filter.organizationId = locOrgId;
-        if (args?.name) filter.name = args.name;
-        if (args?.city) filter.city = args.city;
-        if (args?.region_id) filter.regionId = args.region_id;
-        if (args?.country_id) filter.countryId = args.country_id;
-        if (args?.psa_id) filter.psaId = args.psa_id;
-
-        if (Object.keys(filter).length > 0) params.filter = filter;
-        if (args?.sort) params.sort = args.sort;
-        params.page = {
-          size: (args?.page_size as number) || 50,
-          number: (args?.page_number as number) || 1,
-        };
+        const params = searchParams(
+          args,
+          ["name", "city", "region_id", "country_id", "psa_id"],
+          locOrgId ? { organizationId: locOrgId } : {}
+        );
 
         const result = await client.request("/locations", params);
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(result, null, 2),
-            },
-          ],
-        };
+        return textResult(result);
       }
 
       case "get_location": {
         if (!args?.id) {
-          return {
-            content: [{ type: "text", text: "Error: Location ID is required" }],
-            isError: true,
-          };
+          return errorResult("Location ID is required");
         }
         const location = await client.get(`/locations/${args.id}`);
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(location, null, 2),
-            },
-          ],
-        };
+        return textResult(location);
       }
 
       case "create_location": {
-        if (!args?.organization_id || !args?.name) {
-          return {
-            content: [{ type: "text", text: "Error: organization_id and name are required" }],
-            isError: true,
-          };
-        }
+        requireArgs(args, ["organization_id", "name"]);
         // IT Glue accepts snake_case attribute keys on write (same precedent as
         // document creation). The organization is supplied via the relationship
         // path, so it is not repeated in attributes.
-        const argv = args as Record<string, unknown>;
-        const attributes: Record<string, unknown> = { name: argv.name };
-        const writableFields = [
-          "country_id", "region_id", "address_1", "address_2",
-          "city", "postal_code", "phone", "fax", "notes", "primary",
-        ];
-        for (const field of writableFields) {
-          const value = argv[field];
-          if (value !== undefined && value !== null) attributes[field] = value;
-        }
+        const attributes = {
+          name: args.name,
+          ...attributesFromArgs(args, LOCATION_WRITABLE_FIELDS),
+        };
         const newLocation = await client.post(
           `/organizations/${args.organization_id}/relationships/locations`,
           { data: { type: "locations", attributes } }
         );
-        return {
-          content: [{ type: "text", text: JSON.stringify(newLocation, null, 2) }],
-        };
+        return textResult(newLocation);
       }
 
       case "update_location": {
-        if (!args?.organization_id || !args?.id) {
-          return {
-            content: [{ type: "text", text: "Error: organization_id and id are required" }],
-            isError: true,
-          };
-        }
-        const argv = args as Record<string, unknown>;
-        const attributes: Record<string, unknown> = {};
-        const writableFields = [
-          "name", "country_id", "region_id", "address_1", "address_2",
-          "city", "postal_code", "phone", "fax", "notes", "primary",
-        ];
-        for (const field of writableFields) {
-          const value = argv[field];
-          if (value !== undefined && value !== null) attributes[field] = value;
-        }
+        requireArgs(args, ["organization_id", "id"]);
+        const attributes = attributesFromArgs(args, [
+          "name",
+          ...LOCATION_WRITABLE_FIELDS,
+        ]);
         if (Object.keys(attributes).length === 0) {
-          return {
-            content: [{ type: "text", text: "Error: provide at least one field to update (e.g. phone, address_1, city)" }],
-            isError: true,
-          };
+          return errorResult("provide at least one field to update (e.g. phone, address_1, city)");
         }
         const updatedLocation = await client.patch(
           `/organizations/${args.organization_id}/relationships/locations/${args.id}`,
           { data: { type: "locations", attributes } }
         );
-        return {
-          content: [{ type: "text", text: JSON.stringify(updatedLocation, null, 2) }],
-        };
+        return textResult(updatedLocation);
       }
 
       // Passwords
       case "search_passwords": {
-        const params: Record<string, unknown> = {};
-        const filter: Record<string, unknown> = {};
-
         let pwOrgId = args?.organization_id as number | undefined;
-
-        // If no organization_id, elicit an organization name search to find it
         if (!pwOrgId) {
-          const orgSearch = await elicitText(
-            "Passwords are easier to find when scoped to an organization. Which organization?",
-            "organization",
-            "Enter an organization name to search for"
+          const resolved = await resolveOrganizationId(
+            client,
+            "Passwords are easier to find when scoped to an organization. Which organization?"
           );
-          if (orgSearch) {
-            // Search for the organization to get its ID
-            const orgResult = await client.request("/organizations", {
-              filter: { name: orgSearch },
-              page: { size: 5, number: 1 },
-            });
-            const orgs = orgResult.data as Array<Record<string, unknown>>;
-            if (orgs.length === 1) {
-              pwOrgId = Number(orgs[0].id);
-            } else if (orgs.length > 1) {
-              // Return the org list so the LLM can ask the user to pick
-              return {
-                content: [
-                  {
-                    type: "text",
-                    text: `Multiple organizations match "${orgSearch}". Please re-run with a specific organization_id:\n\n${JSON.stringify(orgs.map((o) => ({ id: o.id, name: o.name })), null, 2)}`,
-                  },
-                ],
-              };
-            }
-          }
+          if (resolved.result) return resolved.result;
+          pwOrgId = resolved.id;
         }
 
-        if (pwOrgId) filter.organizationId = pwOrgId;
-        if (args?.name) filter.name = args.name;
-        if (args?.password_category_id) filter.passwordCategoryId = args.password_category_id;
-        if (args?.url) filter.url = args.url;
-        if (args?.username) filter.username = args.username;
-
-        if (Object.keys(filter).length > 0) params.filter = filter;
-        if (args?.sort) params.sort = args.sort;
-        params.page = {
-          size: (args?.page_size as number) || 50,
-          number: (args?.page_number as number) || 1,
-        };
+        const params = searchParams(
+          args,
+          ["name", "password_category_id", "url", "username"],
+          pwOrgId ? { organizationId: pwOrgId } : {}
+        );
         // Don't show passwords in search results for security
         params.show_password = false;
 
         const result = await client.request("/passwords", params);
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(result, null, 2),
-            },
-          ],
-        };
+        return textResult(result);
       }
 
       case "get_password": {
         if (!args?.id) {
-          return {
-            content: [{ type: "text", text: "Error: Password ID is required" }],
-            isError: true,
-          };
+          return errorResult("Password ID is required");
         }
         const showPassword = args?.show_password !== false;
         const password = await client.get(`/passwords/${args.id}`, {
           show_password: showPassword,
         });
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(password, null, 2),
-            },
-          ],
-        };
+        return textResult(password);
       }
 
       // Documents
       case "search_documents": {
         if (!args?.organization_id) {
-          return {
-            content: [{ type: "text", text: "Error: organization_id is required for search_documents" }],
-            isError: true,
-          };
+          return errorResult("organization_id is required for search_documents");
         }
 
-        const params: Record<string, unknown> = {};
-        const filter: Record<string, unknown> = {};
-
-        if (args?.name) filter.name = args.name;
-        if (args?.document_folder_id) filter.documentFolderId = args.document_folder_id;
-
-        if (Object.keys(filter).length > 0) params.filter = filter;
-        if (args?.sort) params.sort = args.sort;
-        params.page = {
-          size: (args?.page_size as number) || 50,
-          number: (args?.page_number as number) || 1,
-        };
+        const params = searchParams(args, ["name", "document_folder_id"]);
 
         try {
           let result: { data: unknown[]; meta: PaginationMeta };
@@ -2117,7 +1797,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             content: [{ type: "text", text }],
           };
         } catch (err: unknown) {
-          const msg = err instanceof Error ? err.message : String(err);
+          const msg = errorMessage(err);
           if (msg.includes("404")) {
             return {
               content: [{
@@ -2132,12 +1812,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "get_document": {
-        if (!args?.organization_id || !args?.id) {
-          return {
-            content: [{ type: "text", text: "Error: organization_id and id are required" }],
-            isError: true,
-          };
-        }
+        requireArgs(args, ["organization_id", "id"]);
         const doc = await client.get<Record<string, unknown>>(
           `/organizations/${args.organization_id}/relationships/documents/${args.id}`
         );
@@ -2149,26 +1824,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const card = await buildDocumentCard(payload, client);
         if (card) payload._card = card;
 
-        return {
-          content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
-        };
+        return textResult(payload);
       }
 
       case "list_document_folders": {
         if (!args?.organization_id) {
-          return {
-            content: [{ type: "text", text: "Error: organization_id is required" }],
-            isError: true,
-          };
+          return errorResult("organization_id is required");
         }
         const params: Record<string, unknown> = {};
-        const filter: Record<string, unknown> = {};
-        if (args?.name) filter.name = args.name;
+        const filter = filterFromArgs(args, ["name"]);
         if (Object.keys(filter).length > 0) params.filter = filter;
-        params.page = {
-          size: (args?.page_size as number) || 50,
-          number: (args?.page_number as number) || 1,
-        };
+        params.page = pageParams(args);
 
         // API-key first: IT Glue is rolling out a public Document Folders
         // resource, so most tenants no longer need a JWT here. Fall back to
@@ -2181,9 +1847,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             params
           );
           if (apiKeyResult) {
-            return {
-              content: [{ type: "text", text: JSON.stringify(apiKeyResult, null, 2) }],
-            };
+            return textResult(apiKeyResult);
           }
         }
 
@@ -2202,11 +1866,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             `/organizations/${args.organization_id}/relationships/document_folders`,
             params
           );
-          return {
-            content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-          };
+          return textResult(result);
         } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
+          const msg = errorMessage(err);
           if (msg.includes("401")) {
             sessionJwt = undefined;
             return {
@@ -2222,12 +1884,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "create_document": {
-        if (!args?.organization_id || !args?.name) {
-          return {
-            content: [{ type: "text", text: "Error: organization_id and name are required" }],
-            isError: true,
-          };
-        }
+        requireArgs(args, ["organization_id", "name"]);
 
         let folderId = args.document_folder_id as number | string | undefined;
         const skipPrompt = args.skip_folder_prompt === true;
@@ -2265,7 +1922,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 // 401 invalidates the cached JWT and falls through to the URL
                 // parser; any other error propagates because something is
                 // genuinely wrong.
-                const msg = err instanceof Error ? err.message : String(err);
+                const msg = errorMessage(err);
                 if (msg.includes("401")) {
                   sessionJwt = undefined;
                 } else {
@@ -2349,35 +2006,23 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           content: args.content as string | undefined,
           document_folder_id: folderId,
         });
-        return {
-          content: [{ type: "text", text: JSON.stringify(newDoc, null, 2) }],
-        };
+        return textResult(newDoc);
       }
 
       // Document Sections
       case "list_document_sections": {
         if (!args?.document_id) {
-          return {
-            content: [{ type: "text", text: "Error: document_id is required" }],
-            isError: true,
-          };
+          return errorResult("document_id is required");
         }
         const result = await client.request(
           `/documents/${args.document_id}/relationships/sections`,
           {}
         );
-        return {
-          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-        };
+        return textResult(result);
       }
 
       case "create_document_section": {
-        if (!args?.document_id || !args?.section_type || !args?.content) {
-          return {
-            content: [{ type: "text", text: "Error: document_id, section_type, and content are required" }],
-            isError: true,
-          };
-        }
+        requireArgs(args, ["document_id", "section_type", "content"]);
         // IT Glue's API stores the section-type value in the `resource_type`
         // attribute (values `Document::Text` / `Document::Heading`). The
         // `section-type` field is accepted but ignored, and passing a
@@ -2389,10 +2034,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
         const apiSectionType = sectionTypeMap[args.section_type as string];
         if (!apiSectionType) {
-          return {
-            content: [{ type: "text", text: "Error: section_type must be 'heading' or 'text'" }],
-            isError: true,
-          };
+          return errorResult("section_type must be 'heading' or 'text'");
         }
         const newSection = await client.post(
           `/documents/${args.document_id}/relationships/sections`,
@@ -2406,18 +2048,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             },
           }
         );
-        return {
-          content: [{ type: "text", text: JSON.stringify(newSection, null, 2) }],
-        };
+        return textResult(newSection);
       }
 
       case "update_document_section": {
-        if (!args?.document_id || !args?.section_id || !args?.content) {
-          return {
-            content: [{ type: "text", text: "Error: document_id, section_id, and content are required" }],
-            isError: true,
-          };
-        }
+        requireArgs(args, ["document_id", "section_id", "content"]);
         const updatedSection = await client.patch(
           `/documents/${args.document_id}/relationships/sections/${args.section_id}`,
           {
@@ -2429,47 +2064,30 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             },
           }
         );
-        return {
-          content: [{ type: "text", text: JSON.stringify(updatedSection, null, 2) }],
-        };
+        return textResult(updatedSection);
       }
 
       case "delete_document_section": {
-        if (!args?.document_id || !args?.section_id) {
-          return {
-            content: [{ type: "text", text: "Error: document_id and section_id are required" }],
-            isError: true,
-          };
-        }
+        requireArgs(args, ["document_id", "section_id"]);
         await client.delete(
           `/documents/${args.document_id}/relationships/sections/${args.section_id}`
         );
-        return {
-          content: [{ type: "text", text: `Section ${args.section_id} deleted successfully` }],
-        };
+        return textResult(`Section ${args.section_id} deleted successfully`);
       }
 
       case "publish_document": {
         if (!args?.document_id) {
-          return {
-            content: [{ type: "text", text: "Error: document_id is required" }],
-            isError: true,
-          };
+          return errorResult("document_id is required");
         }
         // Publish uses PATCH — POST returns 404
         const published = await client.patch(`/documents/${args.document_id}/publish`);
-        return {
-          content: [{ type: "text", text: JSON.stringify(published, null, 2) }],
-        };
+        return textResult(published);
       }
 
       case "archive_document":
       case "unarchive_document": {
         if (!args?.document_id) {
-          return {
-            content: [{ type: "text", text: "Error: document_id is required" }],
-            isError: true,
-          };
+          return errorResult("document_id is required");
         }
         // IT Glue toggles archive state via PATCH /documents/:id with the
         // standard JSON:API document resource shape. There is no dedicated
@@ -2481,9 +2099,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             attributes: { archived },
           },
         });
-        return {
-          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-        };
+        return textResult(result);
       }
 
       // Flexible Assets
@@ -2495,38 +2111,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         params.page = { size: 100, number: 1 };
 
         const result = await client.request("/flexible_asset_types", params);
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(result, null, 2),
-            },
-          ],
-        };
+        return textResult(result);
       }
 
       case "search_flexible_assets": {
         if (!args?.flexible_asset_type_id) {
-          return {
-            content: [{ type: "text", text: "Error: flexible_asset_type_id is required" }],
-            isError: true,
-          };
+          return errorResult("flexible_asset_type_id is required");
         }
 
-        const params: Record<string, unknown> = {};
-        const filter: Record<string, unknown> = {
+        const params = searchParams(args, ["organization_id", "name"], {
           flexibleAssetTypeId: args.flexible_asset_type_id,
-        };
-
-        if (args?.organization_id) filter.organizationId = args.organization_id;
-        if (args?.name) filter.name = args.name;
-
-        params.filter = filter;
-        if (args?.sort) params.sort = args.sort;
-        params.page = {
-          size: (args?.page_size as number) || 50,
-          number: (args?.page_number as number) || 1,
-        };
+        });
 
         const result = await client.request("/flexible_assets", params);
         const redactedResult = await redactFlexibleAssetResult(
@@ -2534,14 +2129,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           Number(args.flexible_asset_type_id),
           result as unknown as Record<string, unknown>
         );
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(redactedResult, null, 2),
-            },
-          ],
-        };
+        return textResult(redactedResult);
       }
 
       case "search_user_metrics": {
@@ -2550,99 +2138,45 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           args?.end_date as string | undefined
         );
         if ("error" in dateFilter) {
-          return {
-            content: [{ type: "text", text: `Error: ${dateFilter.error}` }],
-            isError: true,
-          };
+          return errorResult(dateFilter.error);
         }
 
         if (args?.sort) {
           const field = String(args.sort).replace(/^-/, "");
           if (!(USER_METRIC_SORT_FIELDS as readonly string[]).includes(field)) {
-            return {
-              content: [
-                {
-                  type: "text",
-                  text:
-                    `Error: sort must be one of ${USER_METRIC_SORT_FIELDS.join(", ")} ` +
-                    `(optionally prefixed with - for descending); got "${args.sort}"`,
-                },
-              ],
-              isError: true,
-            };
+            return errorResult(
+              `sort must be one of ${USER_METRIC_SORT_FIELDS.join(", ")} ` +
+                `(optionally prefixed with - for descending); got "${args.sort}"`
+            );
           }
         }
 
-        const params: Record<string, unknown> = {};
-        const filter: Record<string, unknown> = {};
-
-        if (args?.user_id) filter.userId = args.user_id;
-        if (args?.organization_id) filter.organizationId = args.organization_id;
-        if (args?.resource_type) filter.resourceType = args.resource_type;
-        if (dateFilter.value !== null) filter.date = dateFilter.value;
-
-        if (Object.keys(filter).length > 0) params.filter = filter;
-        if (args?.sort) params.sort = args.sort;
-        params.page = {
-          size: (args?.page_size as number) || 50,
-          number: (args?.page_number as number) || 1,
-        };
+        const params = searchParams(
+          args,
+          ["user_id", "organization_id", "resource_type"],
+          dateFilter.value !== null ? { date: dateFilter.value } : {}
+        );
 
         const result = await client.request("/user_metrics", params);
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(result, null, 2),
-            },
-          ],
-        };
+        return textResult(result);
       }
 
       // Health check
       case "itglue_health_check": {
         const result = await client.request("/organization_types", { page: { size: 1 } });
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(
-                {
-                  status: "ok",
-                  message: "IT Glue API is reachable",
-                  region: credentials.region,
-                  organizationTypesFound: result.meta.totalCount,
-                },
-                null,
-                2
-              ),
-            },
-          ],
-        };
+        return textResult({
+          status: "ok",
+          message: "IT Glue API is reachable",
+          region: credentials.region,
+          organizationTypesFound: result.meta.totalCount,
+        });
       }
 
       default:
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Unknown tool: ${name}`,
-            },
-          ],
-          isError: true,
-        };
+        return textResult(`Unknown tool: ${name}`, true);
     }
   } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : String(error);
-    return {
-      content: [
-        {
-          type: "text",
-          text: `Error: ${errorMessage}`,
-        },
-      ],
-      isError: true,
-    };
+    return errorResult(errorMessage(error));
   }
 });
 
