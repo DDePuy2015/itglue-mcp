@@ -30,13 +30,18 @@ import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/
 import {
   createMcpServer,
   type GatewayCredentials,
-  type ITGlueRegion,
 } from "./mcp-server.js";
 import {
   ITGLUE_BACKEND_TOKEN_HEADER,
   validateBackendToken,
 } from "./backend-auth.js";
 import { runWithServerRef } from "./utils/server-ref.js";
+import {
+  backendAuthResponse,
+  credentialsFromHeaders,
+  credentialsFromVars,
+  MISSING_CREDENTIALS_BODY,
+} from "./utils/gateway.js";
 
 export interface Env {
   ITGLUE_API_KEY?: string;
@@ -99,57 +104,26 @@ export default {
         request.headers.get(ITGLUE_BACKEND_TOKEN_HEADER) ?? undefined
       );
       if (backendAuthFailure) {
-        return json(
-          {
-            error:
-              backendAuthFailure === "not_configured"
-                ? "Backend authentication is not configured."
-                : "Backend authentication failed.",
-          },
-          backendAuthFailure === "not_configured" ? 503 : 401
-        );
+        const { status, body } = backendAuthResponse(backendAuthFailure);
+        return json(body, status);
       }
 
       const isGatewayMode = (env.AUTH_MODE ?? "env") === "gateway";
 
       let credOverrides: GatewayCredentials | undefined;
       if (isGatewayMode) {
-        const h = (name: string) => request.headers.get(name) ?? undefined;
-        const apiKey = h("x-itglue-api-key") || h("x-api-key");
-        const jwt = h("x-itglue-jwt");
+        credOverrides =
+          credentialsFromHeaders(
+            (name) => request.headers.get(name) ?? undefined
+          ) ?? undefined;
 
-        if (!apiKey && !jwt) {
-          return json(
-            {
-              error: "Missing credentials",
-              message:
-                "Gateway mode requires X-ITGlue-API-Key or X-ITGlue-JWT header",
-              required: ["X-ITGlue-API-Key OR X-ITGlue-JWT"],
-              optional: ["X-ITGlue-Region", "X-ITGlue-Base-URL"],
-            },
-            401
-          );
+        if (!credOverrides) {
+          return json(MISSING_CREDENTIALS_BODY, 401);
         }
-
-        credOverrides = {
-          apiKey,
-          jwt,
-          region: (h("x-itglue-region") || "us") as ITGlueRegion,
-          baseUrl: h("x-itglue-base-url"),
-        };
       } else {
         // env mode: build credentials from Worker secrets if present.
         // (Absent creds are fine — tools/list still works, tools/call errors.)
-        const apiKey = env.ITGLUE_API_KEY || env.X_API_KEY;
-        const jwt = env.ITGLUE_JWT;
-        if (apiKey || jwt) {
-          credOverrides = {
-            apiKey,
-            jwt,
-            region: (env.ITGLUE_REGION || "us") as ITGlueRegion,
-            baseUrl: env.ITGLUE_BASE_URL,
-          };
-        }
+        credOverrides = credentialsFromVars(env);
       }
 
       // Fresh server + transport per request (stateless). The server is

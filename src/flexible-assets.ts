@@ -6,6 +6,14 @@
  * exposes small, typed tools on top of the generic JSON:API resource.
  */
 
+import { kebabToCamel } from "./utils/json-api.js";
+import {
+  errorMessage,
+  errorResult,
+  textResult,
+  type ToolResult,
+} from "./utils/tool-result.js";
+
 export interface FlexibleAssetClient {
   request<T = Record<string, unknown>>(
     path: string,
@@ -57,10 +65,6 @@ export interface FlexibleAssetSchema {
 }
 
 type JsonRecord = Record<string, unknown>;
-type ToolResult = {
-  content: Array<{ type: "text"; text: string }>;
-  isError?: boolean;
-};
 
 const field = (
   id: string,
@@ -195,22 +199,10 @@ export const SENSITIVE_FLEXIBLE_ASSET_TYPE_ID = 393982;
 const dynamicFieldCache = new Map<number, { expiresAt: number; fields: FlexibleAssetField[] }>();
 const DYNAMIC_SCHEMA_CACHE_MS = 5 * 60 * 1000;
 
-function textResult(value: unknown, isError = false): ToolResult {
-  return { content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }], ...(isError ? { isError: true } : {}) };
-}
-
-function errorResult(message: string): ToolResult {
-  return textResult(`Error: ${message}`, true);
-}
-
 function numberId(value: unknown, label: string): number {
   const id = typeof value === "string" ? Number(value) : value;
   if (!Number.isSafeInteger(id) || Number(id) <= 0) throw new Error(`${label} must be a positive integer`);
   return Number(id);
-}
-
-function kebabToCamel(value: string): string {
-  return value.replace(/-([a-z])/g, (_, letter: string) => letter.toUpperCase());
 }
 
 function getTrait(record: JsonRecord, fieldDef: FlexibleAssetField): unknown {
@@ -551,7 +543,7 @@ export async function handleFlexibleAssetTool(name: string, args: JsonRecord, cl
       }
       return textResult(results);
     } catch (error) {
-      return errorResult(error instanceof Error ? error.message : String(error));
+      return errorResult(errorMessage(error));
     }
   }
 
@@ -603,6 +595,6 @@ export async function handleFlexibleAssetTool(name: string, args: JsonRecord, cl
     const updated = await client.patch<JsonRecord>(`/flexible_assets/${id}`, assetBody(schema, organizationId, mergedValues, writableExistingTraits(schema, existing)));
     return textResult(normalizeRecord(redactRecord(updated, schema.fields), schema));
   } catch (error) {
-    return errorResult(error instanceof Error ? error.message : String(error));
+    return errorResult(errorMessage(error));
   }
 }

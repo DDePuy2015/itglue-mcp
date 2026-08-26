@@ -17,13 +17,17 @@ import { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import {
   createMcpServer,
   type GatewayCredentials,
-  type ITGlueRegion,
 } from "./mcp-server.js";
 import {
   ITGLUE_BACKEND_TOKEN_HEADER,
   validateBackendToken,
 } from "./backend-auth.js";
 import { runWithServerRef, bindServerRef } from "./utils/server-ref.js";
+import {
+  backendAuthResponse,
+  credentialsFromHeaders,
+  MISSING_CREDENTIALS_BODY,
+} from "./utils/gateway.js";
 import { verifyS2sHeader, S2S_HEADER } from "./s2s-verify.js";
 
 const S2S_SECRET = process.env.CONDUIT_S2S_SECRET || "";
@@ -135,16 +139,12 @@ async function startHttpTransport(): Promise<void> {
         suppliedBackendToken
       );
       if (backendAuthFailure) {
-        res.writeHead(backendAuthFailure === "not_configured" ? 503 : 401, {
+        const { status, body } = backendAuthResponse(backendAuthFailure);
+        res.writeHead(status, {
           "Content-Type": "application/json",
           "Cache-Control": "no-store",
         });
-        res.end(JSON.stringify({
-          error:
-            backendAuthFailure === "not_configured"
-              ? "Backend authentication is not configured."
-              : "Backend authentication failed.",
-        }));
+        res.end(JSON.stringify(body));
         return;
       }
 
@@ -152,32 +152,15 @@ async function startHttpTransport(): Promise<void> {
       let gatewayCredentials: GatewayCredentials | undefined;
       if (isGatewayMode) {
         const headers = req.headers as Record<string, string | string[] | undefined>;
-        const apiKey =
-          (headers["x-itglue-api-key"] as string) ||
-          (headers["x-api-key"] as string);
-        const jwt = (headers["x-itglue-jwt"] as string) || undefined;
+        gatewayCredentials =
+          credentialsFromHeaders((name) => headers[name] as string | undefined) ??
+          undefined;
 
-        if (!apiKey && !jwt) {
+        if (!gatewayCredentials) {
           res.writeHead(401, { "Content-Type": "application/json" });
-          res.end(
-            JSON.stringify({
-              error: "Missing credentials",
-              message: "Gateway mode requires X-ITGlue-API-Key or X-ITGlue-JWT header",
-              required: ["X-ITGlue-API-Key OR X-ITGlue-JWT"],
-            })
-          );
+          res.end(JSON.stringify(MISSING_CREDENTIALS_BODY));
           return;
         }
-
-        const baseUrl = headers["x-itglue-base-url"] as string | undefined;
-        const region = headers["x-itglue-region"] as string | undefined;
-
-        gatewayCredentials = {
-          apiKey,
-          jwt,
-          region: (region || "us") as ITGlueRegion,
-          baseUrl: baseUrl || undefined,
-        };
       }
 
       // Stateless: create fresh server + transport for each request
