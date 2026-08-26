@@ -220,6 +220,58 @@ function apiErrorStatus(err: unknown): number | null {
   return match ? Number(match[1]) : null;
 }
 
+/**
+ * Characters legal in a request path. Every path this client is handed is
+ * built from literal segments plus IT Glue resource ids, so the charset is
+ * narrow by construction.
+ */
+const SAFE_PATH = /^\/[A-Za-z0-9/_.-]*$/;
+
+/**
+ * Reject a request path whose interpolated ids carry path or query syntax.
+ *
+ * Tool arguments arrive as untyped JSON — the low-level MCP `Server` does not
+ * enforce a tool's `inputSchema` — and every handler interpolates ids straight
+ * into a path. Without this check an id of `1/../users` retargets the request
+ * at a different IT Glue endpoint, and `1?show_password=true` smuggles query
+ * parameters into a call the tool never intended (both reachable from prompt
+ * injection in fetched IT Glue content).
+ */
+export function assertSafeRequestPath(path: string): string {
+  const segments = path.split("/").slice(1);
+  const malformed =
+    !SAFE_PATH.test(path) || segments.some((s) => s === "" || s === "." || s === "..");
+  if (malformed) {
+    throw new Error(
+      `Invalid IT Glue request path "${path}": resource ids must not be empty or ` +
+        `contain path or query characters`
+    );
+  }
+  return path;
+}
+
+/**
+ * Validate a base-URL override (ITGLUE_BASE_URL / X-ITGlue-Base-URL). The
+ * override decides where the caller's IT Glue credentials are sent, so a
+ * non-HTTP(S) or unparseable value is refused rather than passed to `fetch`.
+ */
+export function normalizeBaseUrl(baseUrl: string): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(baseUrl);
+  } catch {
+    throw new Error(
+      `Invalid IT Glue base URL "${baseUrl}": expected an absolute URL such as https://api.itglue.com`
+    );
+  }
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+    throw new Error(
+      `Invalid IT Glue base URL "${baseUrl}": only http and https are supported`
+    );
+  }
+  return `${parsed.origin}${parsed.pathname.replace(/\/$/, "")}`;
+}
+
 // Simple IT Glue client
 export class ITGlueClient {
   private readonly apiKey?: string;
@@ -239,7 +291,7 @@ export class ITGlueClient {
     this.jwt = config.jwt;
 
     if (config.baseUrl) {
-      this.baseUrl = config.baseUrl;
+      this.baseUrl = normalizeBaseUrl(config.baseUrl);
     } else {
       const region = config.region || "us";
       // REGION_URLS is keyed by ITGlueRegion, but callers reach this via an
@@ -296,7 +348,7 @@ export class ITGlueClient {
     path: string,
     params: Record<string, unknown> = {}
   ): Promise<{ data: T[]; meta: PaginationMeta }> {
-    const url = `${this.baseUrl}${path}${this.buildQueryString(params)}`;
+    const url = `${this.baseUrl}${assertSafeRequestPath(path)}${this.buildQueryString(params)}`;
 
     const response = await fetch(url, {
       method: "GET",
@@ -340,7 +392,7 @@ export class ITGlueClient {
   }
 
   async post<T>(path: string, body: Record<string, unknown>): Promise<T> {
-    const url = `${this.baseUrl}${path}`;
+    const url = `${this.baseUrl}${assertSafeRequestPath(path)}`;
 
     const response = await fetch(url, {
       method: "POST",
@@ -369,7 +421,7 @@ export class ITGlueClient {
   }
 
   async patch<T>(path: string, body: Record<string, unknown> = {}): Promise<T> {
-    const url = `${this.baseUrl}${path}`;
+    const url = `${this.baseUrl}${assertSafeRequestPath(path)}`;
 
     const response = await fetch(url, {
       method: "PATCH",
@@ -398,7 +450,7 @@ export class ITGlueClient {
   }
 
   async delete(path: string): Promise<void> {
-    const url = `${this.baseUrl}${path}`;
+    const url = `${this.baseUrl}${assertSafeRequestPath(path)}`;
 
     const response = await fetch(url, {
       method: "DELETE",

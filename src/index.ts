@@ -25,6 +25,11 @@ import {
 } from "./backend-auth.js";
 import { runWithServerRef, bindServerRef } from "./utils/server-ref.js";
 import { verifyS2sHeader, S2S_HEADER } from "./s2s-verify.js";
+import {
+  isOriginAllowed,
+  ORIGIN_REJECTED_MESSAGE,
+  parseAllowedOrigins,
+} from "./origin.js";
 
 const S2S_SECRET = process.env.CONDUIT_S2S_SECRET || "";
 
@@ -79,8 +84,19 @@ async function startHttpTransport(): Promise<void> {
   const host = process.env.MCP_HTTP_HOST || "0.0.0.0";
   const isGatewayMode = process.env.AUTH_MODE === "gateway";
 
+  const allowedOrigins = parseAllowedOrigins(process.env.ALLOWED_ORIGINS);
+
   const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse) => {
     const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+
+    // Origin validation (DNS-rebinding protection per the MCP Streamable HTTP
+    // spec). Only browser-issued requests carry an Origin, so the gateway,
+    // health probes, and CLI callers are unaffected.
+    if (!isOriginAllowed(req.headers.origin, allowedOrigins)) {
+      res.writeHead(403, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: ORIGIN_REJECTED_MESSAGE }));
+      return;
+    }
 
     // Health endpoint - no auth required
     if (url.pathname === "/health") {

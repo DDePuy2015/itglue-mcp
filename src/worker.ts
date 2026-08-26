@@ -37,6 +37,11 @@ import {
   validateBackendToken,
 } from "./backend-auth.js";
 import { runWithServerRef } from "./utils/server-ref.js";
+import {
+  isOriginAllowed,
+  ORIGIN_REJECTED_MESSAGE,
+  parseAllowedOrigins,
+} from "./origin.js";
 
 export interface Env {
   ITGLUE_API_KEY?: string;
@@ -47,26 +52,45 @@ export interface Env {
   ITGLUE_BACKEND_TOKEN?: string;
   AUTH_MODE?: string;
   LOG_LEVEL?: string;
+  /** Comma-separated browser origins allowed to reach this Worker. */
+  ALLOWED_ORIGINS?: string;
 }
 
-const CORS_HEADERS: Record<string, string> = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-  "Access-Control-Allow-Headers":
-    "Content-Type, Accept, Authorization, Mcp-Session-Id, MCP-Protocol-Version, X-ITGlue-API-Key, X-API-Key, X-ITGlue-JWT, X-ITGlue-Region, X-ITGlue-Base-URL, X-Summit-ITGlue-Backend-Token",
-  "Access-Control-Expose-Headers": "Mcp-Session-Id",
-};
+const CORS_METHODS = "GET, POST, DELETE, OPTIONS";
+const CORS_ALLOW_HEADERS =
+  "Content-Type, Accept, Authorization, Mcp-Session-Id, MCP-Protocol-Version, X-ITGlue-API-Key, X-API-Key, X-ITGlue-JWT, X-ITGlue-Region, X-ITGlue-Base-URL, X-Summit-ITGlue-Backend-Token";
 
-function json(body: unknown, status = 200): Response {
+/**
+ * CORS headers for an allowed request. The grant is per-origin (never the `*`
+ * wildcard for a concrete origin) so a browser page on an unlisted origin
+ * cannot read this server's responses, and `Vary: Origin` keeps caches from
+ * serving one origin's grant to another.
+ */
+function corsHeaders(origin: string | null): Record<string, string> {
+  if (!origin) return {};
+  return {
+    "Access-Control-Allow-Origin": origin,
+    Vary: "Origin",
+    "Access-Control-Allow-Methods": CORS_METHODS,
+    "Access-Control-Allow-Headers": CORS_ALLOW_HEADERS,
+    "Access-Control-Expose-Headers": "Mcp-Session-Id",
+  };
+}
+
+function json(
+  body: unknown,
+  status = 200,
+  cors: Record<string, string> = {}
+): Response {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { "Content-Type": "application/json", ...CORS_HEADERS },
+    headers: { "Content-Type": "application/json", ...cors },
   });
 }
 
-function withCors(res: Response): Response {
+function withCors(res: Response, cors: Record<string, string>): Response {
   const headers = new Headers(res.headers);
-  for (const [k, v] of Object.entries(CORS_HEADERS)) headers.set(k, v);
+  for (const [k, v] of Object.entries(cors)) headers.set(k, v);
   return new Response(res.body, {
     status: res.status,
     statusText: res.statusText,
@@ -77,20 +101,34 @@ function withCors(res: Response): Response {
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
+    const origin = request.headers.get("origin");
+    const originAllowed = isOriginAllowed(
+      origin,
+      parseAllowedOrigins(env.ALLOWED_ORIGINS)
+    );
+    const cors = originAllowed ? corsHeaders(origin) : {};
+
+    if (!originAllowed) {
+      return json({ error: ORIGIN_REJECTED_MESSAGE }, 403);
+    }
 
     // CORS preflight
     if (request.method === "OPTIONS") {
-      return new Response(null, { status: 204, headers: CORS_HEADERS });
+      return new Response(null, { status: 204, headers: cors });
     }
 
     // Shallow, unauthenticated liveness probe.
     if (url.pathname === "/health" || url.pathname === "/healthz") {
-      return json({ status: "ok" });
+      return json({ status: "ok" }, 200, cors);
     }
 
     if (url.pathname === "/ready") {
       const ready = Boolean(env.ITGLUE_BACKEND_TOKEN);
-      return json({ status: ready ? "ready" : "not_ready" }, ready ? 200 : 503);
+      return json(
+        { status: ready ? "ready" : "not_ready" },
+        ready ? 200 : 503,
+        cors
+      );
     }
 
     if (url.pathname === "/mcp") {
@@ -106,7 +144,8 @@ export default {
                 ? "Backend authentication is not configured."
                 : "Backend authentication failed.",
           },
-          backendAuthFailure === "not_configured" ? 503 : 401
+          backendAuthFailure === "not_configured" ? 503 : 401,
+          cors
         );
       }
 
@@ -127,7 +166,8 @@ export default {
               required: ["X-ITGlue-API-Key OR X-ITGlue-JWT"],
               optional: ["X-ITGlue-Region", "X-ITGlue-Base-URL"],
             },
-            401
+            401,
+            cors
           );
         }
 
@@ -168,7 +208,7 @@ export default {
 
         try {
           const response = await transport.handleRequest(request);
-          return withCors(response);
+          return withCors(response, cors);
         } finally {
           await transport.close();
           await server.close();
@@ -176,6 +216,10 @@ export default {
       });
     }
 
-    return json({ error: "Not found", endpoints: ["/mcp", "/health", "/ready"] }, 404);
+    return json(
+      { error: "Not found", endpoints: ["/mcp", "/health", "/ready"] },
+      404,
+      cors
+    );
   },
 };
