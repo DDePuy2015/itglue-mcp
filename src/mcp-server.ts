@@ -498,6 +498,61 @@ export type FolderReference =
   | { kind: "doc"; docId: number }
   | { kind: "invalid"; input: string };
 
+/** IDs resolved from a document URL without using the URL's hostname. */
+export interface ITGlueDocumentUrlReference {
+  organizationId: number;
+  documentId: number;
+}
+
+/**
+ * Parse an IT Glue document URL into the IDs required by `get_document`.
+ *
+ * Supported browser URL shapes are:
+ *   - /<organization-id>/docs/<document-id>
+ *   - /DOC-<organization-id>-<document-id>
+ *
+ * Query strings and fragments are intentionally ignored. The hostname is not
+ * used to select an API tenant or region; the server's configured credentials
+ * and region remain authoritative, which also keeps custom tenant domains
+ * usable. A path-only value is accepted for the same reason.
+ */
+export function parseITGlueDocumentUrl(
+  input: string | null | undefined
+): ITGlueDocumentUrlReference | null {
+  if (input == null) return null;
+  const trimmed = input.trim();
+  if (trimmed === "") return null;
+
+  let pathname: string;
+  try {
+    const parsed = new URL(trimmed, "https://itglue.invalid");
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return null;
+    }
+    pathname = parsed.pathname.replace(/\/+$/, "");
+  } catch {
+    return null;
+  }
+
+  const match =
+    pathname.match(/^\/(\d+)\/docs\/(\d+)$/) ??
+    pathname.match(/^\/DOC-(\d+)-(\d+)$/i);
+  if (!match) return null;
+
+  const organizationId = Number(match[1]);
+  const documentId = Number(match[2]);
+  if (
+    !Number.isSafeInteger(organizationId) ||
+    organizationId < 1 ||
+    !Number.isSafeInteger(documentId) ||
+    documentId < 1
+  ) {
+    return null;
+  }
+
+  return { organizationId, documentId };
+}
+
 /**
  * IT Glue document folder resource shape (subset used by the folder-picker
  * path). Folders are nested via `parent-id` (kebab) on the wire; the
@@ -1275,7 +1330,12 @@ export function createMcpServer(credentialOverrides?: GatewayCredentials): Serve
       },
       {
         name: "get_document",
-        description: "Get a specific document by ID from IT Glue",
+        description:
+          "Get a specific document from IT Glue. Provide either an IT Glue document URL " +
+          "or both organization_id and id. For example, " +
+          "https://sits.itglue.com/1910707/docs/925762#version=published&documentMode=view " +
+          "resolves to organization_id 1910707 and document id 925762; URL query strings " +
+          "and fragments are ignored.",
         _meta: DOCUMENT_CARD_META,
         inputSchema: {
           type: "object",
@@ -1288,8 +1348,18 @@ export function createMcpServer(credentialOverrides?: GatewayCredentials): Serve
               type: "string",
               description: "The document ID",
             },
+            url: {
+              type: "string",
+              description:
+                "Optional IT Glue document URL. Supports /<organizationId>/docs/<documentId> " +
+                "and /DOC-<organizationId>-<documentId> forms.",
+            },
           },
-          required: ["organization_id", "id"],
+          required: [],
+          anyOf: [
+            { required: ["url"] },
+            { required: ["organization_id", "id"] },
+          ],
         },
       },
       {
@@ -2132,14 +2202,91 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "get_document": {
-        if (!args?.organization_id || !args?.id) {
+        const explicitOrganizationId = args?.organization_id;
+        const explicitDocumentId = args?.id;
+        const documentUrl = args?.url;
+        let organizationId = explicitOrganizationId as number | string | undefined;
+        let documentId = explicitDocumentId as number | string | undefined;
+
+        if (documentUrl !== undefined) {
+          const parsed =
+            typeof documentUrl === "string"
+              ? parseITGlueDocumentUrl(documentUrl)
+              : null;
+          if (!parsed) {
+            return {
+              content: [{
+                type: "text",
+                text:
+                  "Could not parse the IT Glue document URL. Expected " +
+                  "https://<tenant>.itglue.com/<organizationId>/docs/<documentId> " +
+                  "or /DOC-<organizationId>-<documentId>; query strings and fragments " +
+                  "are allowed.",
+              }],
+              isError: true,
+            };
+          }
+
+          const numericId = (value: unknown): number | null => {
+            const numberValue =
+              typeof value === "number"
+                ? value
+                : typeof value === "string" && /^\d+$/.test(value.trim())
+                  ? Number(value.trim())
+                  : NaN;
+            return Number.isSafeInteger(numberValue) && numberValue > 0
+              ? numberValue
+              : null;
+          };
+
+          if (
+            explicitOrganizationId !== undefined &&
+            numericId(explicitOrganizationId) !== parsed.organizationId
+          ) {
+            return {
+              content: [{
+                type: "text",
+                text:
+                  `The URL organization ID (${parsed.organizationId}) does not match ` +
+                  `organization_id (${String(explicitOrganizationId)}). Provide one ` +
+                  "matching organization reference.",
+              }],
+              isError: true,
+            };
+          }
+          if (
+            explicitDocumentId !== undefined &&
+            numericId(explicitDocumentId) !== parsed.documentId
+          ) {
+            return {
+              content: [{
+                type: "text",
+                text:
+                  `The URL document ID (${parsed.documentId}) does not match ` +
+                  `id (${String(explicitDocumentId)}). Provide one matching document ` +
+                  "reference.",
+              }],
+              isError: true,
+            };
+          }
+
+          organizationId = parsed.organizationId;
+          documentId = parsed.documentId;
+        }
+
+        if (!organizationId || !documentId) {
           return {
-            content: [{ type: "text", text: "Error: organization_id and id are required" }],
+            content: [{
+              type: "text",
+              text:
+                "Error: provide either an IT Glue document url or both " +
+                "organization_id and id",
+            }],
             isError: true,
           };
         }
         const doc = await client.get<Record<string, unknown>>(
-          `/organizations/${args.organization_id}/relationships/documents/${args.id}`
+          `/organizations/${organizationId}/relationships/documents/${documentId}`
         );
         const payload: Record<string, unknown> = { ...doc };
 

@@ -30,6 +30,7 @@ import {
   getCredentialsFromEnv,
   ITGlueClient,
   listDocumentFoldersViaApiKey,
+  parseITGlueDocumentUrl,
   parseFolderReference,
   requestDocumentsWithFolderDefault,
   rootLevelDocumentsNote,
@@ -345,7 +346,7 @@ describe("Tool Definitions", () => {
     { name: "search_passwords", requiredFields: [] as string[], properties: ["organization_id", "name", "password_category_id", "url", "username", "page_size", "page_number", "sort"] },
     { name: "get_password", requiredFields: ["id"], properties: ["id", "show_password"] },
     { name: "search_documents", requiredFields: ["organization_id"] as string[], properties: ["organization_id", "name", "page_size", "page_number", "sort"] },
-    { name: "get_document", requiredFields: ["organization_id", "id"], properties: ["organization_id", "id"] },
+    { name: "get_document", requiredFields: [] as string[], properties: ["organization_id", "id", "url"] },
     { name: "list_document_folders", requiredFields: ["organization_id"], properties: ["organization_id", "name", "page_size", "page_number"] },
     { name: "create_document", requiredFields: ["organization_id", "name"], properties: ["organization_id", "name", "content"] },
     { name: "list_document_sections", requiredFields: ["document_id"], properties: ["document_id"] },
@@ -1372,6 +1373,38 @@ describe("Tool Handler Integration", () => {
         kind: "invalid",
         input: "https://example.com/somewhere/else",
       });
+    });
+  });
+
+  describe("parseITGlueDocumentUrl", () => {
+    it("extracts organization and document IDs from the browser URL", () => {
+      expect(
+        parseITGlueDocumentUrl(
+          "https://sits.itglue.com/1910707/docs/925762#version=published&documentMode=view"
+        )
+      ).toEqual({ organizationId: 1910707, documentId: 925762 });
+    });
+
+    it("ignores query strings, fragments, and trailing slashes", () => {
+      expect(
+        parseITGlueDocumentUrl(
+          "https://tenant.example/1910707/docs/925762/?version=published#documentMode=view"
+        )
+      ).toEqual({ organizationId: 1910707, documentId: 925762 });
+    });
+
+    it("supports the legacy DOC-org-document URL shape", () => {
+      expect(
+        parseITGlueDocumentUrl("https://tenant.itglue.com/DOC-1910707-925762/")
+      ).toEqual({ organizationId: 1910707, documentId: 925762 });
+    });
+
+    it("rejects missing organization IDs, malformed paths, and nonnumeric IDs", () => {
+      expect(parseITGlueDocumentUrl("https://tenant.itglue.com/docs/925762")).toBeNull();
+      expect(parseITGlueDocumentUrl("https://tenant.itglue.com/1910707/document/925762")).toBeNull();
+      expect(parseITGlueDocumentUrl("https://tenant.itglue.com/abc/docs/925762")).toBeNull();
+      expect(parseITGlueDocumentUrl("https://tenant.itglue.com/1910707/docs/abc")).toBeNull();
+      expect(parseITGlueDocumentUrl("not a URL")).toBeNull();
     });
   });
 
@@ -2596,6 +2629,111 @@ describe("Document folder access (API-key-first, round-trip)", () => {
       // Fetched from the single-document relationship endpoint.
       expect(decodedUrl(0)).toContain(
         "/organizations/8250506/relationships/documents/20022034"
+      );
+    });
+
+    it("retrieves a document from a URL without explicit IDs", async () => {
+      const client = await connectClient({ apiKey: "test-api-key" });
+      mockFetch.mockResolvedValueOnce(
+        createMockResponse({
+          data: {
+            id: "925762",
+            type: "documents",
+            attributes: {
+              name: "URL document",
+              content: [],
+            },
+          },
+          meta: {},
+        })
+      );
+
+      const result = await client.callTool({
+        name: "get_document",
+        arguments: {
+          url: "https://sits.itglue.com/1910707/docs/925762#version=published&documentMode=view",
+        },
+      });
+
+      expect(isError(result)).toBe(false);
+      expect(firstText(result)).toContain("URL document");
+      expect(decodedUrl(0)).toContain(
+        "/organizations/1910707/relationships/documents/925762"
+      );
+    });
+
+    it("accepts matching explicit IDs alongside a document URL", async () => {
+      const client = await connectClient({ apiKey: "test-api-key" });
+      mockFetch.mockResolvedValueOnce(
+        createMockResponse({
+          data: {
+            id: "925762",
+            type: "documents",
+            attributes: { name: "Matching URL document", content: [] },
+          },
+          meta: {},
+        })
+      );
+
+      const result = await client.callTool({
+        name: "get_document",
+        arguments: {
+          url: "https://sits.itglue.com/1910707/docs/925762",
+          organization_id: 1910707,
+          id: "925762",
+        },
+      });
+
+      expect(isError(result)).toBe(false);
+      expect(firstText(result)).toContain("Matching URL document");
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it("rejects conflicting URL and explicit IDs before calling IT Glue", async () => {
+      const client = await connectClient({ apiKey: "test-api-key" });
+
+      const result = await client.callTool({
+        name: "get_document",
+        arguments: {
+          url: "https://sits.itglue.com/1910707/docs/925762",
+          organization_id: 999999,
+          id: "925762",
+        },
+      });
+
+      expect(isError(result)).toBe(true);
+      expect(firstText(result)).toContain("does not match");
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it("rejects a malformed document URL before calling IT Glue", async () => {
+      const client = await connectClient({ apiKey: "test-api-key" });
+
+      const result = await client.callTool({
+        name: "get_document",
+        arguments: { url: "https://sits.itglue.com/docs/925762" },
+      });
+
+      expect(isError(result)).toBe(true);
+      expect(firstText(result)).toContain("Could not parse");
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it("advertises URL and explicit-ID alternatives in the tool schema", async () => {
+      const client = await connectClient({ apiKey: "test-api-key" });
+      const { tools } = await client.listTools();
+      const tool = tools.find((candidate) => candidate.name === "get_document");
+      const schema = tool?.inputSchema as {
+        properties?: Record<string, unknown>;
+        anyOf?: unknown[];
+      };
+
+      expect(schema.properties).toHaveProperty("url");
+      expect(schema.anyOf).toEqual(
+        expect.arrayContaining([
+          { required: ["url"] },
+          { required: ["organization_id", "id"] },
+        ])
       );
     });
   });

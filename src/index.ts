@@ -45,6 +45,7 @@ export {
   documentBodyOmittedNote,
   folderedDocumentsIncludedNote,
   listDocumentFoldersViaApiKey,
+  parseITGlueDocumentUrl,
   parseFolderReference,
   requestDocumentsWithFolderDefault,
   rootLevelDocumentsNote,
@@ -53,6 +54,7 @@ export {
 export type {
   DocumentSearchAttempt,
   GatewayCredentials,
+  ITGlueDocumentUrlReference,
   ITGlueRegion,
 } from "./mcp-server.js";
 
