@@ -137,7 +137,7 @@ If you do need the JWT fallback, provide it in whichever way matches your deploy
 ### Documents
 
 - **search_documents** - Search for documents with filtering by organization, name, or folder. Defaults to a folder-inclusive listing (each result carries its `documentFolderId`), degrading gracefully to a root-only listing on tenants whose API rejects the folder filter
-- **get_document** - Get a specific document by ID, including its sectioned body. Renders as an interactive card in MCP Apps hosts — see [Interactive Document Card](#interactive-document-card-mcp-apps)
+- **get_document** - Get a specific document by ID or IT Glue URL, including its sectioned body. A URL such as `https://sits.itglue.com/1910707/docs/925762#version=published&documentMode=view` resolves to organization `1910707` and document `925762`; query strings and fragments are ignored. Renders as an interactive card in MCP Apps hosts — see [Interactive Document Card](#interactive-document-card-mcp-apps)
 - **list_document_folders** - List an organization's document folders (names and IDs). Works with an API key on tenants where IT Glue exposes the Document Folders resource; falls back to a JWT otherwise — see [JWT fallback for document-folder operations](#jwt-fallback-for-document-folder-operations)
 
 ### Flexible Assets
@@ -291,6 +291,7 @@ Once configured, you can ask Claude:
 - "Get the configuration details for device ID 12345"
 - "Find all passwords for organization ID 100"
 - "Search for flexible assets of type 54321"
+- "Open this IT Glue document: https://sits.itglue.com/1910707/docs/925762#version=published&documentMode=view"
 
 ## Security Notes
 
