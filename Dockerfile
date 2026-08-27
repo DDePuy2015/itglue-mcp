@@ -16,7 +16,7 @@ RUN npm prune --omit=dev --ignore-scripts
 
 FROM node:26-alpine AS runner
 
-LABEL io.modelcontextprotocol.server.name="io.github.wyre-technology/itglue-mcp"
+LABEL io.modelcontextprotocol.server.name="io.github.WYRE-AI/itglue-mcp"
 
 WORKDIR /app
 
