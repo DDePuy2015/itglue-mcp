@@ -35,9 +35,12 @@ import {
   requestDocumentsWithFolderDefault,
   rootLevelDocumentsNote,
   stripDocumentBodies,
+  stripPasswordValues,
 } from "../index.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { elicitText } from "../utils/elicitation.js";
+import { runWithServerRef } from "../utils/server-ref.js";
 
 // Store original env vars
 const originalEnv = { ...process.env };
@@ -162,6 +165,190 @@ describe("Utility Functions", () => {
       expect(result.createdAt).toBe("2024-01-01");
       expect((result.nested as Record<string, unknown>).innerKey).toBe("value");
     });
+  });
+
+  describe("password result redaction", () => {
+    it("removes only top-level password fields", () => {
+      expect(
+        stripPasswordValues([
+          {
+            id: "1",
+            name: "Synthetic password record",
+            password: "DO_NOT_RETURN_THIS_FAKE_VALUE",
+            username: "admin",
+          },
+          { id: "2", name: "Record without a password field" },
+          null,
+        ])
+      ).toEqual([
+        {
+          id: "1",
+          name: "Synthetic password record",
+          username: "admin",
+        },
+        { id: "2", name: "Record without a password field" },
+        null,
+      ]);
+    });
+  });
+});
+
+describe("Search security hardening (round-trip)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  async function connectClient(): Promise<Client> {
+    const server = createMcpServer({ apiKey: "test-api-key" });
+    const [clientTransport, serverTransport] =
+      InMemoryTransport.createLinkedPair();
+    await server.connect(serverTransport);
+    const client = new Client({ name: "search-security-test", version: "1.0.0" });
+    await client.connect(clientTransport);
+    return client;
+  }
+
+  function firstText(result: unknown): string {
+    const r = result as { content?: Array<{ text?: string }> };
+    return r.content?.[0]?.text ?? "";
+  }
+
+  it("redacts password values from the real search_passwords response", async () => {
+    const client = await connectClient();
+    mockFetch.mockResolvedValueOnce(
+      createMockResponse(
+        createJsonApiResponse([
+          {
+            id: "1",
+            type: "passwords",
+            attributes: {
+              name: "Synthetic password record",
+              password: "DO_NOT_RETURN_THIS_FAKE_VALUE",
+            },
+          },
+        ])
+      )
+    );
+
+    const result = await client.callTool({
+      name: "search_passwords",
+      arguments: { organization_id: 123 },
+    });
+
+    const text = firstText(result);
+    expect(text).toContain("Synthetic password record");
+    expect(text).not.toContain("DO_NOT_RETURN_THIS_FAKE_VALUE");
+    expect(decodeURIComponent(mockFetch.mock.calls[0][0] as string)).toContain(
+      "filter[organization-id]=123"
+    );
+    expect(decodeURIComponent(mockFetch.mock.calls[0][0] as string)).toContain(
+      "show_password=false"
+    );
+  });
+
+  it("warns for unscoped configuration, location, and password searches", async () => {
+    const client = await connectClient();
+    const stderr = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const response = createJsonApiResponse([], {
+      "current-page": 2,
+      "total-pages": 8,
+      "total-count": 400,
+    });
+    mockFetch
+      .mockResolvedValueOnce(createMockResponse(response))
+      .mockResolvedValueOnce(createMockResponse(response))
+      .mockResolvedValueOnce(createMockResponse(response));
+
+    for (const name of [
+      "search_configurations",
+      "search_locations",
+      "search_passwords",
+    ]) {
+      const result = await client.callTool({ name, arguments: {} });
+      const text = firstText(result);
+      expect(text).toContain("NOT scoped to an organization");
+      expect(text).toContain("ALL organizations");
+      expect(text).toContain("page 2 of 8");
+      expect(text).toContain("400 matching entries");
+    }
+
+    expect(decodeURIComponent(mockFetch.mock.calls[0][0] as string)).not.toContain(
+      "filter[organization-id]"
+    );
+    expect(stderr).toHaveBeenCalled();
+  });
+
+  it("does not warn when an organization filter was actually sent", async () => {
+    const client = await connectClient();
+    mockFetch
+      .mockResolvedValueOnce(createMockResponse(createJsonApiResponse([])))
+      .mockResolvedValueOnce(createMockResponse(createJsonApiResponse([])))
+      .mockResolvedValueOnce(createMockResponse(createJsonApiResponse([])));
+
+    for (const [name, expectedPath] of [
+      ["search_configurations", "/configurations"],
+      ["search_locations", "/locations"],
+      ["search_passwords", "/passwords"],
+    ] as const) {
+      const result = await client.callTool({
+        name,
+        arguments: { organization_id: 123 },
+      });
+      expect(firstText(result)).not.toContain("NOT scoped");
+      expect(decodeURIComponent(mockFetch.mock.calls[mockFetch.mock.calls.length - 1][0] as string)).toContain(expectedPath);
+      expect(decodeURIComponent(mockFetch.mock.calls[mockFetch.mock.calls.length - 1][0] as string)).toContain(
+        "filter[organization-id]=123"
+      );
+    }
+  });
+
+  it("warns when a falsy or invalid organization ID does not narrow the request", async () => {
+    const client = await connectClient();
+    const stderr = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    mockFetch
+      .mockResolvedValueOnce(createMockResponse(createJsonApiResponse([])))
+      .mockResolvedValueOnce(createMockResponse(createJsonApiResponse([])));
+
+    for (const organization_id of [0, -1]) {
+      const result = await client.callTool({
+        name: "search_passwords",
+        arguments: { organization_id },
+      });
+      expect(firstText(result)).toContain("NOT scoped to an organization");
+      const url = decodeURIComponent(mockFetch.mock.calls[mockFetch.mock.calls.length - 1][0] as string);
+      expect(url).not.toContain("filter[organization-id]");
+    }
+    expect(stderr).toHaveBeenCalled();
+  });
+
+  it("logs only a bounded reason when elicitation has no server context", async () => {
+    const stderr = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    await expect(elicitText("PROMPT_SECRET", "organization")).resolves.toBeNull();
+    expect(stderr).toHaveBeenCalledWith(
+      "[itglue-mcp] elicitation unavailable: no-server; continuing without user input."
+    );
+    expect(stderr.mock.calls.flat().join(" ")).not.toContain("PROMPT_SECRET");
+  });
+
+  it("logs only a bounded reason when the elicitation request fails", async () => {
+    const stderr = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const fakeServer = {
+      elicitInput: vi.fn().mockRejectedValue(new Error("RAW_EXCEPTION_SECRET")),
+    };
+
+    await runWithServerRef(fakeServer as never, () =>
+      elicitText("PROMPT_SECRET", "organization")
+    );
+
+    expect(stderr).toHaveBeenCalledWith(
+      "[itglue-mcp] elicitation unavailable: request-failed; continuing without user input."
+    );
+    expect(stderr.mock.calls.flat().join(" ")).not.toContain("RAW_EXCEPTION_SECRET");
+    expect(stderr.mock.calls.flat().join(" ")).not.toContain("PROMPT_SECRET");
   });
 });
 
