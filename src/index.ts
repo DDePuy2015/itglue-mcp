@@ -25,6 +25,7 @@ import {
 } from "./backend-auth.js";
 import { runWithServerRef, bindServerRef } from "./utils/server-ref.js";
 import { verifyS2sHeader, S2S_HEADER } from "./s2s-verify.js";
+import { closeQuietly } from "./utils/close.js";
 
 const S2S_SECRET = process.env.CONDUIT_S2S_SECRET || "";
 
@@ -189,9 +190,11 @@ async function startHttpTransport(): Promise<void> {
         enableJsonResponse: true,
       });
 
+      // Teardown runs after the response is done, so a failure here cannot be
+      // reported to the caller — but it must not become an unhandled rejection
+      // that takes the whole process down (both close() calls are async).
       res.on("close", () => {
-        transport.close();
-        server.close();
+        void closeQuietly(transport, server);
       });
 
       // Bind this request's server into the per-request async context
@@ -201,19 +204,29 @@ async function startHttpTransport(): Promise<void> {
       // chain must stay inside this callback so the bound context survives
       // every await gap between here and any later getServerRef() call.
       runWithServerRef(server, () => {
-        server.connect(transport as unknown as Transport).then(() => {
-          transport.handleRequest(req, res);
-        }).catch((err) => {
-          console.error("MCP transport error:", err);
-          if (!res.headersSent) {
-            res.writeHead(500, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({
-              jsonrpc: "2.0",
-              error: { code: -32603, message: "Internal error" },
-              id: null,
-            }));
-          }
-        });
+        server.connect(transport as unknown as Transport)
+          // Returned, not fire-and-forget: handleRequest is async, so without
+          // this the catch below only covered connect() and a rejection while
+          // handling the request became an unhandled rejection that left the
+          // caller waiting on a response that was never written.
+          .then(() => transport.handleRequest(req, res))
+          .catch((err) => {
+            console.error("MCP transport error:", err);
+            if (res.writableEnded) return;
+            if (!res.headersSent) {
+              res.writeHead(500, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({
+                jsonrpc: "2.0",
+                error: { code: -32603, message: "Internal error" },
+                id: null,
+              }));
+              return;
+            }
+            // Headers (or a partial stream) already went out: the status can no
+            // longer be changed, so end the response rather than leaving the
+            // connection open until the client times out.
+            res.end();
+          });
       });
 
       return;
@@ -224,8 +237,13 @@ async function startHttpTransport(): Promise<void> {
     res.end(JSON.stringify({ error: "Not found", endpoints: ["/mcp", "/health", "/ready"] }));
   });
 
-  await new Promise<void>((resolve) => {
+  await new Promise<void>((resolve, reject) => {
+    // A listen failure (EADDRINUSE, EACCES) is emitted as an event: without
+    // this handler startup neither resolved nor rejected and the process hung
+    // as a healthy-looking server that never accepted a connection.
+    httpServer.once("error", reject);
     httpServer.listen(port, host, () => {
+      httpServer.removeListener("error", reject);
       console.error(`IT Glue MCP server listening on http://${host}:${port}/mcp`);
       console.error(`Health check available at http://${host}:${port}/health`);
       console.error(
@@ -238,14 +256,21 @@ async function startHttpTransport(): Promise<void> {
   // Graceful shutdown
   const shutdown = async () => {
     console.error("Shutting down IT Glue MCP server...");
-    await new Promise<void>((resolve, reject) => {
-      httpServer.close((err) => (err ? reject(err) : resolve()));
-    });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        httpServer.close((err) => (err ? reject(err) : resolve()));
+      });
+    } catch (err) {
+      // Report the failed close and exit non-zero so the orchestrator sees an
+      // unclean shutdown instead of an unhandled rejection from the handler.
+      console.error("Error while shutting down IT Glue MCP server:", err);
+      process.exit(1);
+    }
     process.exit(0);
   };
 
-  process.on("SIGINT", shutdown);
-  process.on("SIGTERM", shutdown);
+  process.on("SIGINT", () => void shutdown());
+  process.on("SIGTERM", () => void shutdown());
 }
 
 // Start the server
@@ -260,6 +285,12 @@ async function main() {
 }
 
 // Only bootstrap the server when run as a process, not when imported for tests.
+// A failed bootstrap exits non-zero: logging alone let the process exit 0 (or
+// linger with no transport), so a container that never started successfully
+// still looked like a clean run to whatever supervises it.
 if (process.env.NODE_ENV !== "test") {
-  main().catch(console.error);
+  main().catch((err) => {
+    console.error("Fatal: IT Glue MCP server failed to start:", err);
+    process.exit(1);
+  });
 }

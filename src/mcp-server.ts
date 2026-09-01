@@ -16,6 +16,13 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { elicitSelection, elicitText } from "./utils/elicitation.js";
+import {
+  ITGlueApiError,
+  ITGlueTransportError,
+  apiErrorStatus,
+  describeError,
+  isApiErrorStatus,
+} from "./errors.js";
 import { registerPromptHandlers } from "./prompts.js";
 import { registerResourceHandlers } from "./resources.js";
 import { buildDocumentCard, DOCUMENT_CARD_META } from "./card.builder.js";
@@ -210,15 +217,10 @@ function buildFilterParams(filter: Record<string, unknown>): Record<string, stri
   return result;
 }
 
-/**
- * Extract the HTTP status from an ITGlueClient error message
- * ("IT Glue API error (404): ..."), or null for non-HTTP errors.
- */
-function apiErrorStatus(err: unknown): number | null {
-  const msg = err instanceof Error ? err.message : String(err);
-  const match = msg.match(/IT Glue API error \((\d{3})\)/);
-  return match ? Number(match[1]) : null;
-}
+/** Longest response body echoed into an error message. */
+const ERROR_BODY_SNIPPET = 500;
+
+type HttpMethod = "GET" | "POST" | "PATCH" | "DELETE";
 
 // Simple IT Glue client
 export class ITGlueClient {
@@ -292,36 +294,126 @@ export class ITGlueClient {
     return queryString ? `?${queryString}` : "";
   }
 
+  /**
+   * Perform one IT Glue call and return its parsed JSON:API document.
+   *
+   * Every failure mode is turned into a typed error that names the call and
+   * carries the HTTP status where there is one, so callers can branch on the
+   * status (see errors.ts) and operators get a message that identifies the
+   * request. Without this, a network failure surfaced as a bare
+   * "fetch failed" and an HTML error page from an intermediary surfaced as
+   * "Unexpected token '<'" — neither naming the endpoint or the status.
+   */
+  private async send(
+    method: HttpMethod,
+    path: string,
+    init: { url?: string; headers?: Record<string, string>; body?: string } = {}
+  ): Promise<{ status: number; text: string }> {
+    const url = init.url ?? `${this.baseUrl}${path}`;
+
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        method,
+        headers: {
+          ...this.authHeaders(),
+          Accept: "application/vnd.api+json",
+          ...init.headers,
+        },
+        body: init.body,
+      });
+    } catch (err) {
+      throw new ITGlueTransportError({
+        method,
+        path,
+        detail: `could not reach ${this.baseUrl} (${err instanceof Error ? err.message : String(err)})`,
+        cause: err,
+      });
+    }
+
+    // Reading the body must never mask the status the caller branches on.
+    let text: string;
+    try {
+      text = await response.text();
+    } catch (err) {
+      text = `<response body unreadable: ${err instanceof Error ? err.message : String(err)}>`;
+    }
+
+    if (!response.ok) {
+      throw new ITGlueApiError({ status: response.status, body: text, method, path });
+    }
+
+    return { status: response.status, text };
+  }
+
+  /**
+   * Parse a successful response into a JSON:API document, rejecting bodies
+   * that cannot carry the resources the caller is about to read.
+   */
+  private parseJsonApi(
+    method: HttpMethod,
+    path: string,
+    response: { status: number; text: string }
+  ): JsonApiResponse {
+    let json: JsonApiResponse;
+    try {
+      json = JSON.parse(response.text) as JsonApiResponse;
+    } catch (err) {
+      throw new ITGlueTransportError({
+        method,
+        path,
+        detail:
+          `HTTP ${response.status} body is not JSON — an intermediary (proxy, WAF, SSO ` +
+          `portal) may have answered instead of IT Glue: ` +
+          `${response.text.slice(0, ERROR_BODY_SNIPPET) || "<empty body>"}`,
+        cause: err,
+      });
+    }
+
+    if (json?.errors && json.errors.length > 0) {
+      // A JSON:API error document can arrive with a 2xx status; take the
+      // status the document itself reports so callers still branch correctly.
+      const reported = Number(json.errors[0]?.status);
+      throw new ITGlueApiError({
+        status: Number.isInteger(reported) ? reported : response.status,
+        body: json.errors.map((e) => e.detail || e.title).join(", "),
+        method,
+        path,
+      });
+    }
+
+    return json;
+  }
+
+  /** Deserialize a JSON:API `data` member, rejecting an absent one. */
+  private resourcesFrom(
+    method: HttpMethod,
+    path: string,
+    json: JsonApiResponse
+  ): Array<Record<string, unknown>> {
+    if (json?.data == null) {
+      throw new ITGlueTransportError({
+        method,
+        path,
+        detail: "response contained no JSON:API `data` member",
+      });
+    }
+    return Array.isArray(json.data)
+      ? json.data.map(deserializeResource)
+      : [deserializeResource(json.data)];
+  }
+
   async request<T>(
     path: string,
     params: Record<string, unknown> = {}
   ): Promise<{ data: T[]; meta: PaginationMeta }> {
-    const url = `${this.baseUrl}${path}${this.buildQueryString(params)}`;
-
-    const response = await fetch(url, {
-      method: "GET",
-      headers: {
-        ...this.authHeaders(),
-        "Content-Type": "application/vnd.api+json",
-        Accept: "application/vnd.api+json",
-      },
+    const response = await this.send("GET", path, {
+      url: `${this.baseUrl}${path}${this.buildQueryString(params)}`,
+      headers: { "Content-Type": "application/vnd.api+json" },
     });
 
-    if (!response.ok) {
-      const errorBody = await response.text();
-      throw new Error(`IT Glue API error (${response.status}): ${errorBody}`);
-    }
-
-    const json = (await response.json()) as JsonApiResponse;
-
-    if (json.errors && json.errors.length > 0) {
-      const errorMessages = json.errors.map((e) => e.detail || e.title).join(", ");
-      throw new Error(`IT Glue API error: ${errorMessages}`);
-    }
-
-    const data = Array.isArray(json.data)
-      ? json.data.map(deserializeResource)
-      : [deserializeResource(json.data)];
+    const json = this.parseJsonApi("GET", path, response);
+    const data = this.resourcesFrom("GET", path, json);
 
     const meta: PaginationMeta = {
       currentPage: json.meta?.["current-page"] || 1,
@@ -334,84 +426,49 @@ export class ITGlueClient {
     return { data: data as T[], meta };
   }
 
+  /**
+   * Read a single resource. An empty `data` collection is an error rather
+   * than an `undefined` return: returning undefined pushed the failure into
+   * the caller, which then either serialized `null` as a successful tool
+   * result or threw "Cannot read properties of undefined" several frames away
+   * from the request that actually came back empty.
+   */
   async get<T>(path: string, params: Record<string, unknown> = {}): Promise<T> {
     const result = await this.request<T>(path, params);
+    if (result.data.length === 0) {
+      throw new ITGlueTransportError({
+        method: "GET",
+        path,
+        detail: "IT Glue returned no resource (empty `data`) for a single-resource read",
+      });
+    }
     return result.data[0];
   }
 
-  async post<T>(path: string, body: Record<string, unknown>): Promise<T> {
-    const url = `${this.baseUrl}${path}`;
-
-    const response = await fetch(url, {
-      method: "POST",
-      headers: {
-        ...this.authHeaders(),
-        "Content-Type": "application/vnd.api+json",
-        Accept: "application/vnd.api+json",
-      },
-      body: JSON.stringify(body),
-    });
-
-    if (!response.ok) {
-      const errorBody = await response.text();
-      throw new Error(`IT Glue API error (${response.status}): ${errorBody}`);
-    }
-
-    const json = (await response.json()) as JsonApiResponse;
-
-    if (json.errors && json.errors.length > 0) {
-      const errorMessages = json.errors.map((e) => e.detail || e.title).join(", ");
-      throw new Error(`IT Glue API error: ${errorMessages}`);
-    }
-
-    const resource = Array.isArray(json.data) ? json.data[0] : json.data;
-    return deserializeResource(resource) as T;
-  }
-
-  async patch<T>(path: string, body: Record<string, unknown> = {}): Promise<T> {
-    const url = `${this.baseUrl}${path}`;
-
-    const response = await fetch(url, {
-      method: "PATCH",
-      headers: {
-        ...this.authHeaders(),
-        "Content-Type": "application/vnd.api+json",
-        Accept: "application/vnd.api+json",
-      },
+  private async write<T>(
+    method: "POST" | "PATCH",
+    path: string,
+    body: Record<string, unknown>
+  ): Promise<T> {
+    const response = await this.send(method, path, {
+      headers: { "Content-Type": "application/vnd.api+json" },
       body: Object.keys(body).length > 0 ? JSON.stringify(body) : undefined,
     });
 
-    if (!response.ok) {
-      const errorBody = await response.text();
-      throw new Error(`IT Glue API error (${response.status}): ${errorBody}`);
-    }
+    const json = this.parseJsonApi(method, path, response);
+    return this.resourcesFrom(method, path, json)[0] as T;
+  }
 
-    const json = (await response.json()) as JsonApiResponse;
+  async post<T>(path: string, body: Record<string, unknown>): Promise<T> {
+    return this.write<T>("POST", path, body);
+  }
 
-    if (json.errors && json.errors.length > 0) {
-      const errorMessages = json.errors.map((e) => e.detail || e.title).join(", ");
-      throw new Error(`IT Glue API error: ${errorMessages}`);
-    }
-
-    const resource = Array.isArray(json.data) ? json.data[0] : json.data;
-    return deserializeResource(resource) as T;
+  async patch<T>(path: string, body: Record<string, unknown> = {}): Promise<T> {
+    return this.write<T>("PATCH", path, body);
   }
 
   async delete(path: string): Promise<void> {
-    const url = `${this.baseUrl}${path}`;
-
-    const response = await fetch(url, {
-      method: "DELETE",
-      headers: {
-        ...this.authHeaders(),
-        Accept: "application/vnd.api+json",
-      },
-    });
-
-    if (!response.ok) {
-      const errorBody = await response.text();
-      throw new Error(`IT Glue API error (${response.status}): ${errorBody}`);
-    }
+    await this.send("DELETE", path);
   }
 }
 
@@ -2187,8 +2244,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             content: [{ type: "text", text }],
           };
         } catch (err: unknown) {
-          const msg = err instanceof Error ? err.message : String(err);
-          if (msg.includes("404")) {
+          // Only an actual 404 means "this tenant has no documents resource";
+          // any other failure (including a 500 whose body mentions 404) has to
+          // reach the caller as the error it is.
+          if (isApiErrorStatus(err, 404)) {
             return {
               content: [{
                 type: "text",
@@ -2353,8 +2412,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
           };
         } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          if (msg.includes("401")) {
+          if (isApiErrorStatus(err, 401)) {
             sessionJwt = undefined;
             return {
               content: [{
@@ -2412,8 +2470,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 // 401 invalidates the cached JWT and falls through to the URL
                 // parser; any other error propagates because something is
                 // genuinely wrong.
-                const msg = err instanceof Error ? err.message : String(err);
-                if (msg.includes("401")) {
+                if (isApiErrorStatus(err, 401)) {
                   sessionJwt = undefined;
                 } else {
                   throw err;
@@ -2780,7 +2837,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
     }
   } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : String(error);
+    // Report the whole cause chain: the outer message names the failing call,
+    // the cause carries the reason (DNS failure, TLS error, parse position),
+    // and reporting only `error.message` dropped it entirely.
+    const errorMessage = describeError(error);
     return {
       content: [
         {

@@ -37,7 +37,15 @@ export async function validateBackendToken(
       digest(suppliedToken),
     ]);
     return constantTimeEqual(expected, actual) ? undefined : "missing_or_invalid";
-  } catch {
+  } catch (err) {
+    // Fail closed, but say so: a digest failure means Web Crypto is
+    // unavailable in this runtime, which rejects *every* request and is
+    // otherwise indistinguishable from a caller sending a wrong token. Only
+    // the failure reason is logged — never a token value.
+    console.error(
+      `[itglue-mcp] Backend token validation could not run (rejecting request): ` +
+        `${err instanceof Error ? err.message : String(err)}`
+    );
     return "missing_or_invalid";
   }
 }

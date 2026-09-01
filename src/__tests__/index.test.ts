@@ -36,6 +36,12 @@ import {
   rootLevelDocumentsNote,
   stripDocumentBodies,
 } from "../index.js";
+import {
+  ITGlueApiError,
+  ITGlueTransportError,
+  apiErrorStatus,
+  describeError,
+} from "../errors.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 
@@ -3086,5 +3092,181 @@ describe("user metrics", () => {
 
     const url = decodeURIComponent(mockFetch.mock.calls[0][0] as string);
     expect(url).toContain("sort=-date");
+  });
+});
+
+describe("Error propagation (typed IT Glue failures)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  async function connectClient(credentials: {
+    apiKey?: string;
+    jwt?: string;
+  }): Promise<Client> {
+    const server = createMcpServer(credentials);
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverTransport);
+    const client = new Client({ name: "errors-test", version: "1.0.0" });
+    await client.connect(clientTransport);
+    return client;
+  }
+
+  function textOf(result: unknown): string {
+    return (result as { content?: Array<{ text?: string }> }).content?.[0]?.text ?? "";
+  }
+
+  describe("ITGlueClient", () => {
+    it("throws an error carrying the HTTP status, not just its text", async () => {
+      const client = createClient({ apiKey: "k" });
+      mockFetch.mockResolvedValueOnce(createErrorResponse(503, "upstream busy"));
+
+      const err = await client.request("/organizations").catch((e: unknown) => e);
+
+      expect(err).toBeInstanceOf(ITGlueApiError);
+      expect((err as ITGlueApiError).status).toBe(503);
+      expect((err as ITGlueApiError).path).toBe("/organizations");
+      expect((err as Error).message).toContain("IT Glue API error (503)");
+    });
+
+    it("names the failing request when the network call itself fails", async () => {
+      const client = createClient({ apiKey: "k" });
+      mockFetch.mockRejectedValueOnce(new Error("getaddrinfo ENOTFOUND api.itglue.com"));
+
+      const err = await client.request("/organizations/1/relationships/documents")
+        .catch((e: unknown) => e);
+
+      expect(err).toBeInstanceOf(ITGlueTransportError);
+      expect((err as Error).message).toContain("GET /organizations/1/relationships/documents");
+      // The root cause survives for diagnosis rather than being replaced.
+      expect(describeError(err)).toContain("ENOTFOUND");
+      // A transport failure has no HTTP status, so status-based fallbacks
+      // must not treat it as one.
+      expect(apiErrorStatus(err)).toBeNull();
+    });
+
+    it("reports a non-JSON success body as a failed request, with a body excerpt", async () => {
+      const client = createClient({ apiKey: "k" });
+      mockFetch.mockResolvedValueOnce(
+        Promise.resolve({
+          ok: true,
+          status: 200,
+          text: () => Promise.resolve("<html><body>SSO login required</body></html>"),
+        })
+      );
+
+      const err = await client.request("/organizations").catch((e: unknown) => e);
+
+      expect(err).toBeInstanceOf(ITGlueTransportError);
+      expect((err as Error).message).toContain("GET /organizations");
+      expect((err as Error).message).toContain("SSO login required");
+    });
+
+    it("reports a JSON:API error document using the status the document reports", async () => {
+      const client = createClient({ apiKey: "k" });
+      mockFetch.mockResolvedValueOnce(
+        createMockResponse({ errors: [{ status: "422", detail: "date range too long" }] })
+      );
+
+      const err = await client.request("/user_metrics").catch((e: unknown) => e);
+
+      expect(apiErrorStatus(err)).toBe(422);
+      expect((err as Error).message).toContain("date range too long");
+    });
+
+    it("fails a single-resource read that came back without a resource", async () => {
+      const client = createClient({ apiKey: "k" });
+      mockFetch.mockResolvedValueOnce(createMockResponse(createJsonApiResponse([])));
+
+      const err = await client.get("/organizations/1").catch((e: unknown) => e);
+
+      expect(err).toBeInstanceOf(ITGlueTransportError);
+      expect((err as Error).message).toContain("/organizations/1");
+    });
+  });
+
+  describe("status-based fallbacks branch on the status, not the body text", () => {
+    it("does not report 'no documents' for a 500 whose body mentions 404", async () => {
+      const client = await connectClient({ apiKey: "test-api-key" });
+      mockFetch.mockResolvedValueOnce(
+        createErrorResponse(500, "upstream returned 404 while proxying documents")
+      );
+
+      const result = await client.callTool({
+        name: "search_documents",
+        arguments: { organization_id: 123 },
+      });
+
+      const text = textOf(result);
+      expect((result as { isError?: boolean }).isError).toBe(true);
+      expect(text).not.toContain("may not have the IT Glue Documents module enabled");
+      expect(text).toContain("IT Glue API error (500)");
+    });
+
+    it("still reports 'no documents' on an actual 404", async () => {
+      const client = await connectClient({ apiKey: "test-api-key" });
+      mockFetch.mockResolvedValueOnce(createErrorResponse(404, "Not Found"));
+
+      const result = await client.callTool({
+        name: "search_documents",
+        arguments: { organization_id: 123 },
+      });
+
+      expect(textOf(result)).toContain("may not have the IT Glue Documents module enabled");
+    });
+
+    it("does not clear the JWT for a 500 whose body mentions 401", async () => {
+      const client = await connectClient({ apiKey: "test-api-key", jwt: "good-jwt" });
+      mockFetch
+        .mockResolvedValueOnce(createErrorResponse(403, "Forbidden")) // API key
+        .mockResolvedValueOnce(
+          createErrorResponse(500, "gateway log: prior request got 401")
+        );
+
+      const result = await client.callTool({
+        name: "list_document_folders",
+        arguments: { organization_id: 123 },
+      });
+
+      const text = textOf(result);
+      expect((result as { isError?: boolean }).isError).toBe(true);
+      expect(text).not.toContain("expired");
+      expect(text).toContain("IT Glue API error (500)");
+    });
+
+    it("propagates a network failure from the folder fallback instead of degrading", async () => {
+      mockFetch.mockRejectedValueOnce(new Error("socket hang up"));
+
+      await expect(
+        listDocumentFoldersViaApiKey(createClient({ apiKey: "k" }), 123, {})
+      ).rejects.toThrow(/socket hang up|IT Glue API request failed/);
+    });
+
+    it("propagates a network failure from the document folder-filter fallback", async () => {
+      mockFetch.mockRejectedValueOnce(new Error("socket hang up"));
+
+      await expect(
+        requestDocumentsWithFolderDefault(createClient({ apiKey: "k" }), 123, {})
+      ).rejects.toThrow(/IT Glue API request failed/);
+      // Only the first attempt ran: a transport failure is not a rejected filter.
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe("describeError", () => {
+    it("keeps the cause chain that error.message alone drops", () => {
+      const root = new Error("ECONNRESET");
+      const wrapped = new Error("IT Glue API request failed (GET /x)", { cause: root });
+
+      expect(describeError(wrapped)).toContain("GET /x");
+      expect(describeError(wrapped)).toContain("ECONNRESET");
+    });
+
+    it("terminates on a self-referential cause", () => {
+      const err = new Error("loop") as Error & { cause?: unknown };
+      err.cause = err;
+
+      expect(describeError(err)).toBe("loop");
+    });
   });
 });

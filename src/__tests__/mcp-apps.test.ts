@@ -24,6 +24,7 @@ import {
   MCP_APP_RESOURCE_MIME,
 } from "../card.builder.js";
 import { DOCUMENT_CARD_HTML } from "../generated/document-card-html.js";
+import { ITGlueApiError } from "../errors.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 
@@ -251,15 +252,49 @@ describe("MCP Apps document card", () => {
       expect(await buildDocumentCard({ name: "no id" }, client as never)).toBeNull();
     });
 
-    it("survives section-fetch failures (card is best-effort)", async () => {
+    it("survives section-fetch failures (card is best-effort) and reports them", async () => {
+      const logged = vi.spyOn(console, "error").mockImplementation(() => {});
       const failing = {
         request: vi.fn(async () => {
-          throw new Error("IT Glue 500");
+          throw new ITGlueApiError({
+            status: 500,
+            body: "boom",
+            method: "GET",
+            path: "/documents/9001/relationships/sections",
+          });
         }),
       };
-      const card = await buildDocumentCard(doc, failing as never);
-      expect(card).toMatchObject({ id: "9001", sections: [] });
-      expect(card?.organization).toBe("Acme Corp");
+      try {
+        const card = await buildDocumentCard(doc, failing as never);
+        expect(card).toMatchObject({ id: "9001", sections: [] });
+        expect(card?.organization).toBe("Acme Corp");
+        // The preview is optional, but a broken one is not silent.
+        expect(logged).toHaveBeenCalledTimes(1);
+        expect(logged.mock.calls[0][0]).toContain("9001");
+      } finally {
+        logged.mockRestore();
+      }
+    });
+
+    it("stays quiet for a 404 from the sections endpoint (routine)", async () => {
+      const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+      const notFound = {
+        request: vi.fn(async () => {
+          throw new ITGlueApiError({
+            status: 404,
+            body: "Not Found",
+            method: "GET",
+            path: "/documents/9001/relationships/sections",
+          });
+        }),
+      };
+      try {
+        const card = await buildDocumentCard(doc, notFound as never);
+        expect(card).toMatchObject({ id: "9001", sections: [] });
+        expect(logged).not.toHaveBeenCalled();
+      } finally {
+        logged.mockRestore();
+      }
     });
   });
 
