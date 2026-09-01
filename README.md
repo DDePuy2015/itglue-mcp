@@ -62,11 +62,12 @@ The server accepts credentials via environment variables:
 | `ITGLUE_JWT` | A user-session JWT used as an optional **fallback** for document-folder operations on tenants whose API key cannot access the Document Folders resource yet. See [JWT fallback for document-folder operations](#jwt-fallback-for-document-folder-operations). | No |
 | `ITGLUE_REGION` | API region: `us`, `eu`, or `au` (default: `us`) | No |
 | `ITGLUE_BACKEND_TOKEN` | Hosted deployment token required on proxy-to-provider `/mcp` requests | No (HTTP only) |
-| `ITGLUE_BASE_URL` | Override the IT Glue API base URL (advanced) | No |
+| `ITGLUE_BASE_URL` | Override the IT Glue API base URL (advanced; must be an absolute `http`/`https` URL) | No |
 | `MCP_TRANSPORT` | Transport: `stdio` (local) or `http` (remote). Defaults to `stdio` when run via `npx`/`node`, and to `http` in the Docker image. | No |
 | `MCP_HTTP_PORT` | Port for HTTP transport (default: `8080`) | No |
 | `MCP_HTTP_HOST` | Bind address for HTTP transport (default: `0.0.0.0`) | No |
 | `AUTH_MODE` | `env` (read credentials from environment) or `gateway` (read per-request credentials from HTTP headers). Default: `env`. | No |
+| `ALLOWED_ORIGINS` | Comma-separated browser origins permitted to reach the HTTP transports, e.g. `https://app.example.com`. Requests that send no `Origin` (the gateway, health probes, CLI callers) are always served; a browser request from an unlisted origin gets `403`. Unset means no browser origin is allowed; the single value `*` allows any. | No (HTTP only) |
 
 Alternative: When `AUTH_MODE=gateway`, the MCP Gateway injects credentials per request via HTTP headers instead of environment variables. See [Remote Deployment](#remote-deployment-http-streamable).
 
