@@ -9,6 +9,18 @@ export interface ElicitOption {
   label: string;
 }
 
+type ElicitationFailureReason = "no-server" | "request-failed";
+
+/**
+ * Keep diagnostics useful without exposing prompt text, arguments, exception
+ * details, tokens, or customer data. stdout is reserved for stdio MCP traffic.
+ */
+function noteElicitationUnavailable(reason: ElicitationFailureReason): void {
+  console.error(
+    `[itglue-mcp] elicitation unavailable: ${reason}; continuing without user input.`
+  );
+}
+
 /**
  * Ask the user to select from a list of options.
  */
@@ -18,7 +30,10 @@ export async function elicitSelection(
   options: ElicitOption[]
 ): Promise<string | null> {
   const server = getServerRef();
-  if (!server) return null;
+  if (!server) {
+    noteElicitationUnavailable("no-server");
+    return null;
+  }
 
   try {
     const result = await server.elicitInput({
@@ -43,6 +58,7 @@ export async function elicitSelection(
     }
     return null;
   } catch {
+    noteElicitationUnavailable("request-failed");
     return null;
   }
 }
@@ -56,7 +72,10 @@ export async function elicitText(
   description?: string
 ): Promise<string | null> {
   const server = getServerRef();
-  if (!server) return null;
+  if (!server) {
+    noteElicitationUnavailable("no-server");
+    return null;
+  }
 
   try {
     const result = await server.elicitInput({
@@ -79,6 +98,7 @@ export async function elicitText(
     }
     return null;
   } catch {
+    noteElicitationUnavailable("request-failed");
     return null;
   }
 }
@@ -90,7 +110,10 @@ export async function elicitConfirmation(
   message: string
 ): Promise<boolean | null> {
   const server = getServerRef();
-  if (!server) return null;
+  if (!server) {
+    noteElicitationUnavailable("no-server");
+    return null;
+  }
 
   try {
     const result = await server.elicitInput({
@@ -113,6 +136,7 @@ export async function elicitConfirmation(
     }
     return null;
   } catch {
+    noteElicitationUnavailable("request-failed");
     return null;
   }
 }

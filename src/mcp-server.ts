@@ -193,6 +193,22 @@ function deserializeResource(resource: JsonApiResource): Record<string, unknown>
   return result;
 }
 
+/**
+ * Drop one top-level field from every resource in a list result.
+ *
+ * `deserializeResource` flattens `attributes` and camelCases the keys, so the
+ * fields withheld from list responses are top-level record properties here.
+ */
+function omitResourceField(items: unknown[], field: string): unknown[] {
+  return items.map((item) => {
+    if (item && typeof item === "object" && field in item) {
+      const { [field]: _omitted, ...rest } = item as Record<string, unknown>;
+      return rest;
+    }
+    return item;
+  });
+}
+
 function buildFilterParams(filter: Record<string, unknown>): Record<string, string> {
   const result: Record<string, string> = {};
   for (const [key, value] of Object.entries(filter)) {
@@ -687,13 +703,12 @@ export function folderedDocumentsIncludedNote(): string {
  * If IT Glue renames the body field or adds another heavy one, revisit this.
  */
 export function stripDocumentBodies(docs: unknown[]): unknown[] {
-  return docs.map((doc) => {
-    if (doc && typeof doc === "object" && "content" in doc) {
-      const { content: _body, ...rest } = doc as Record<string, unknown>;
-      return rest;
-    }
-    return doc;
-  });
+  return omitResourceField(docs, "content");
+}
+
+/** Remove secret values from bulk password-search results. */
+export function stripPasswordValues(passwords: unknown[]): unknown[] {
+  return omitResourceField(passwords, "password");
 }
 
 /** Advisory that document bodies are omitted from `search_documents` results. */
@@ -703,6 +718,42 @@ export function documentBodyOmittedNote(): string {
     "item is metadata only. Call get_document (or list_document_sections) to read a specific " +
     "document's content."
   );
+}
+
+/**
+ * Explain that a search ran account-wide and include bounded pagination
+ * context so an arbitrary page or empty result is not mistaken for a complete
+ * organization-scoped answer.
+ */
+export function unscopedSearchNote(
+  resource: string,
+  meta: PaginationMeta
+): string {
+  return (
+    `NOTE: this search was NOT scoped to an organization — no organization_id was ` +
+    `supplied and one could not be determined, so it searched ${resource} across ` +
+    `ALL organizations — returning page ${meta.currentPage} of ${meta.totalPages} ` +
+    `(${meta.totalCount} matching entries account-wide). An empty or unexpected ` +
+    `result here does NOT mean the entry is absent. To scope the search, call ` +
+    `search_organizations to find the organization's id, then re-run this tool ` +
+    `with organization_id set.`
+  );
+}
+
+/** Emit the warning only when the filter sent to IT Glue lacks organizationId. */
+function unscopedSearchNoteFor(
+  resource: string,
+  filter: Record<string, unknown>,
+  meta: PaginationMeta
+): string {
+  return filter.organizationId === undefined
+    ? unscopedSearchNote(resource, meta)
+    : "";
+}
+
+/** Only positive safe integer organization IDs can safely narrow these lists. */
+function isValidOrganizationId(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
 }
 
 /** Which filter form ultimately produced a `search_documents` listing. */
@@ -1855,7 +1906,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }
         }
 
-        if (configOrgId) filter.organizationId = configOrgId;
+        if (isValidOrganizationId(configOrgId)) filter.organizationId = configOrgId;
         if (args?.name) filter.name = args.name;
         if (args?.configuration_type_id) filter.configurationTypeId = args.configuration_type_id;
         if (args?.configuration_status_id) filter.configurationStatusId = args.configuration_status_id;
@@ -1871,13 +1922,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
 
         const result = await client.request("/configurations", params);
+        const configText = [
+          unscopedSearchNoteFor("configurations", filter, result.meta),
+          JSON.stringify(result, null, 2),
+        ]
+          .filter(Boolean)
+          .join("\n\n");
         return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(result, null, 2),
-            },
-          ],
+          content: [{ type: "text", text: configText }],
         };
       }
 
@@ -1935,7 +1987,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }
         }
 
-        if (locOrgId) filter.organizationId = locOrgId;
+        if (isValidOrganizationId(locOrgId)) filter.organizationId = locOrgId;
         if (args?.name) filter.name = args.name;
         if (args?.city) filter.city = args.city;
         if (args?.region_id) filter.regionId = args.region_id;
@@ -1950,13 +2002,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
 
         const result = await client.request("/locations", params);
+        const locText = [
+          unscopedSearchNoteFor("locations", filter, result.meta),
+          JSON.stringify(result, null, 2),
+        ]
+          .filter(Boolean)
+          .join("\n\n");
         return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(result, null, 2),
-            },
-          ],
+          content: [{ type: "text", text: locText }],
         };
       }
 
@@ -2076,7 +2129,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }
         }
 
-        if (pwOrgId) filter.organizationId = pwOrgId;
+        if (isValidOrganizationId(pwOrgId)) filter.organizationId = pwOrgId;
         if (args?.name) filter.name = args.name;
         if (args?.password_category_id) filter.passwordCategoryId = args.password_category_id;
         if (args?.url) filter.url = args.url;
@@ -2092,13 +2145,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         params.show_password = false;
 
         const result = await client.request("/passwords", params);
+        const redacted = {
+          ...result,
+          data: stripPasswordValues(result.data as unknown[]),
+        };
+        const pwText = [
+          unscopedSearchNoteFor("passwords", filter, result.meta),
+          JSON.stringify(redacted, null, 2),
+        ]
+          .filter(Boolean)
+          .join("\n\n");
         return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(result, null, 2),
-            },
-          ],
+          content: [{ type: "text", text: pwText }],
         };
       }
 
