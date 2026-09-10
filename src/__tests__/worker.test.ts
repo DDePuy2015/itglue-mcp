@@ -88,13 +88,44 @@ describe("Cloudflare Worker entrypoint", () => {
     expect(res.status).toBe(401);
   });
 
-  it("answers CORS preflight", async () => {
-    const res = await worker.fetch(
-      new Request("http://worker.local/mcp", { method: "OPTIONS" }),
-      {}
+  it("answers CORS preflight for an allow-listed origin only", async () => {
+    const env: Env = { ALLOWED_ORIGINS: "https://app.example.com" };
+    const allowed = await worker.fetch(
+      new Request("http://worker.local/mcp", {
+        method: "OPTIONS",
+        headers: { Origin: "https://app.example.com" },
+      }),
+      env
     );
-    expect(res.status).toBe(204);
-    expect(res.headers.get("Access-Control-Allow-Origin")).toBe("*");
+    expect(allowed.status).toBe(204);
+    expect(allowed.headers.get("Access-Control-Allow-Origin")).toBe(
+      "https://app.example.com"
+    );
+
+    const rejected = await worker.fetch(
+      new Request("http://worker.local/mcp", {
+        method: "OPTIONS",
+        headers: { Origin: "https://evil.example.com" },
+      }),
+      env
+    );
+    expect(rejected.status).toBe(403);
+    expect(rejected.headers.get("Access-Control-Allow-Origin")).toBeNull();
+  });
+
+  it("rejects browser origins when ALLOWED_ORIGINS is unset", async () => {
+    const res = await mcp(
+      { jsonrpc: "2.0", id: 1, method: "initialize", params: {} },
+      DEFAULT_ENV,
+      { Origin: "https://evil.example.com" }
+    );
+    expect(res.status).toBe(403);
+  });
+
+  it("serves callers that send no Origin (gateway, probes, CLI)", async () => {
+    const res = await worker.fetch(new Request("http://worker.local/health"), {});
+    expect(res.status).toBe(200);
+    expect(res.headers.get("Access-Control-Allow-Origin")).toBeNull();
   });
 
   it("404s unknown paths", async () => {
