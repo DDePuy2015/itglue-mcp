@@ -100,8 +100,9 @@ jobs:
           labels: |
             org.opencontainers.image.source=https://github.com/DDePuy2015/itglue-mcp
             org.opencontainers.image.revision=${{ env.EXPECTED_SHA }}
-          sbom: true
-          provenance: mode=max
+          # The local Docker exporter cannot load a manifest list with
+          # attestations; the manual publisher attaches SBOM/provenance to the
+          # pushed digest after these same source gates pass.
 
       - name: Scan local image for fixable critical and high CVEs
         uses: docker/scout-action@f8c776824083494ab0d56b8105ba2ca85c86e4de # v1.18.2
