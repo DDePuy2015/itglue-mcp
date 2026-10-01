@@ -114,13 +114,13 @@ jobs:
           provenance: mode=max
 
       - name: Scan published image for fixable critical and high CVEs
-        uses: docker/scout-action@f8c776824083494ab0d56b8105ba2ca85c86e4de # v1.18.2
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
         with:
-          command: cves
-          image: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
-          only-severities: critical,high
-          only-fixed: true
-          exit-code: true
+          image-ref: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+          vuln-type: os,library
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: '1'
 
       - name: Report immutable image and attestations
         shell: bash
