@@ -122,7 +122,7 @@ jobs:
             .[0]
             | .Architecture == "amd64"
               and .Config.Cmd == ["node", "dist/index.js"]
-              and .Config.Entrypoint == null
+              and .Config.Entrypoint == ["docker-entrypoint.sh"]
               and .Config.User == "mcp"
           '
           runtime="$(docker run --rm --platform linux/amd64 --entrypoint node "$LOCAL_IMAGE" -e 'process.stdout.write(process.platform + "/" + process.arch)')"
