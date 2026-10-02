@@ -5,6 +5,8 @@ name: Fork Container Validation
 # to Azure. It is also callable by the manual publisher so the exact source
 # checks and runtime gates run before a GHCR push.
 on:
+  push:
+    branches: [main]
   pull_request:
     branches: [main]
   workflow_call:
@@ -27,8 +29,8 @@ jobs:
     name: Validate source and runtime image
     runs-on: ubuntu-latest
     env:
-      EXPECTED_SHA: ${{ inputs.source_sha || github.event.pull_request.head.sha }}
-      LOCAL_IMAGE: ${{ inputs.image_tag || format('itglue-mcp:pr-{0}', github.event.pull_request.number) }}
+      EXPECTED_SHA: ${{ inputs.source_sha || github.event.pull_request.head.sha || github.sha }}
+      LOCAL_IMAGE: ${{ inputs.image_tag || format('itglue-mcp:{0}', github.sha) }}
       NODE_AUTH_TOKEN: ${{ github.token }}
 
     steps:
