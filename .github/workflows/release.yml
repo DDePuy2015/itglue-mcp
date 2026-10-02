@@ -1,47 +1,26 @@
 name: Release
 
 on:
-  push:
-    branches: [main]
   pull_request:
     branches: [main]
 
-# Thin caller for the canonical reusable release pipeline. The build →
-# semantic-release → Docker → MCP Registry → security chain (tag-based release
-# detection + correct gating) lives in WYRE-AI/.github so every *-mcp
-# repo stays in lockstep instead of drifting per-repo. PR-time lint/test gating
-# is each repo's ci.yml concern; this workflow only runs the release path.
-# Caller jobs grant the token scopes the reusable jobs request (a reusable can
-# only reduce, never expand, caller-granted scope).
-jobs:
-  release:
-    permissions:
-      contents: write
-      issues: write
-      pull-requests: write
-      packages: write
-      id-token: write
-      security-events: write
-    uses: WYRE-AI/.github/.github/workflows/mcp-server-release.yml@8c2360058e882a8afacfc4cebf840135789ef406
-    with:
-      server-name: itglue-mcp
-      image-name: ghcr.io/wyre-ai/itglue-mcp
-    secrets: inherit
+# Fork safety guard. The inherited upstream caller could semantic-release,
+# publish to the upstream GHCR namespace and MCP Registry through OIDC, and
+# upload security results. This fork keeps PR verification read-only; the
+# Summit-owned image path is available only through the separately reviewed,
+# manually approved GHCR-only publisher.
+permissions:
+  contents: read
 
-  # Summit owns the Azure deployment boundary for this fork. The upstream
-  # deploy workflow targets the provider's Azure tenant and is intentionally
-  # disabled here; production rollout uses Summit ACR and the operations
-  # repository runbook after the source PR merges.
-  # deploy:
-  #   needs: release
-  #   if: needs.release.outputs.released == 'true'
-  #   permissions:
-  #     id-token: write
-  #     contents: read
-  #   uses: WYRE-AI/.github/.github/workflows/mcp-server-deploy.yml@8c2360058e882a8afacfc4cebf840135789ef406
-  #   with:
-  #     vendor-slug: itglue
-  #     image-name: ghcr.io/wyre-ai/itglue-mcp
-  #     digest: ${{ needs.release.outputs.digest }}
-  #     version: ${{ needs.release.outputs.version }}
-  #   secrets: inherit
+jobs:
+  fork-release-guard:
+    name: Fork release disabled
+    runs-on: ubuntu-latest
+    steps:
+      - name: Confirm fork release guard
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "DDePuy2015/itglue-mcp"
+          echo "Upstream release, MCP Registry publication, OIDC, and automatic image publishing are disabled for this Summit fork."
+          echo "PR validation runs in fork-container-validation.yml; image publication requires the manual GHCR-only workflow."

@@ -22,6 +22,10 @@ WORKDIR /app
 
 ENV NODE_ENV=production
 
+# npm is build-time tooling only; do not ship its separate CLI dependency tree
+# in the runtime image. The service starts directly with Node.js.
+RUN rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx
+
 # Create non-root user
 RUN addgroup --system --gid 1001 nodejs && \
     adduser --system --uid 1001 mcp
