@@ -1,9 +1,11 @@
-name: Fork Image Publish (GHCR only)
+name: Fork Image Publish (ACR only)
 
-# This workflow is intentionally manual and is not part of PR validation.
-# It has no release, tag, npm-publish, MCP Registry, OIDC, Azure deployment, or
-# upstream-namespace step. The exact source commit must already be reachable
-# from Summit fork main, and the exact image tag is commit-derived.
+# Manual, single-operator production publication for the Summit fork. Pull
+# requests and pushes use the read-only validation workflow; this workflow is
+# the only path that can push an image. It builds the merged source commit in
+# Summit ACR, scans it, creates SBOM/provenance evidence, and signs the exact
+# digest with keyless Cosign. It does not deploy Azure or update operations
+# records automatically.
 on:
   workflow_dispatch:
     inputs:
@@ -11,41 +13,44 @@ on:
         description: 40-character merged-main commit SHA to build exactly
         required: true
         type: string
-      image_tag:
-        description: Immutable image tag; must be sha-<40-character source SHA>
+      acr_login_server:
+        description: Summit ACR login server
         required: true
+        default: summititmcpacr.azurecr.io
         type: string
-      confirm_publish:
-        description: Type PUBLISH_DDEPUY2015_ITGLUE_MCP to enable GHCR push
+      image_repository:
+        description: ACR repository name
         required: true
+        default: itglue-mcp
         type: string
+      release_confirmation:
+        description: Confirm this is an intentional single-operator production publish from main
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: read
-  packages: read
 
 concurrency:
-  group: fork-image-publish
+  group: itglue-acr-publish
   cancel-in-progress: false
-
-env:
-  IMAGE: ghcr.io/ddepuy2015/itglue-mcp
 
 jobs:
   guard:
-    name: Confirm Summit fork publisher
+    name: Confirm Summit ACR publisher
     runs-on: ubuntu-latest
     steps:
-      - name: Validate repository, ref, and publish confirmation
+      - name: Validate repository, ref, and release confirmation
         shell: bash
         env:
-          CONFIRM_PUBLISH: ${{ inputs.confirm_publish }}
+          RELEASE_CONFIRMATION: ${{ inputs.release_confirmation }}
         run: |
           set -euo pipefail
           test "$GITHUB_REPOSITORY" = "DDePuy2015/itglue-mcp"
           test "$GITHUB_REF" = "refs/heads/main"
-          test "$CONFIRM_PUBLISH" = "PUBLISH_DDEPUY2015_ITGLUE_MCP"
-          echo "Manual GHCR-only publication is authorized for this run."
+          test "$RELEASE_CONFIRMATION" = "true"
+          echo "Manual ACR publication is authorized for this merged-main run."
 
   validate:
     name: Re-run source and runtime gates
@@ -56,16 +61,18 @@ jobs:
       image_tag: itglue-mcp:publish-${{ inputs.source_sha }}
 
   publish:
-    name: Build and push linux/amd64 image to fork GHCR
+    name: Build, scan, sign, and attest immutable ACR image
     needs: [guard, validate]
     if: needs.guard.result == 'success' && needs.validate.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write
+      id-token: write
     env:
       SOURCE_SHA: ${{ inputs.source_sha }}
-      IMAGE_TAG: ${{ inputs.image_tag }}
+      ACR_LOGIN_SERVER: ${{ inputs.acr_login_server }}
+      IMAGE_REPOSITORY: ${{ inputs.image_repository }}
+      IMAGE_TAG: ${{ inputs.source_sha }}
 
     steps:
       - name: Checkout exact source commit
@@ -75,12 +82,11 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Verify immutable source and tag inputs
+      - name: Verify immutable merged source
         shell: bash
         run: |
           set -euo pipefail
           [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
-          test "$IMAGE_TAG" = "sha-$SOURCE_SHA"
           actual_sha="$(git rev-parse HEAD)"
           test "$actual_sha" = "$SOURCE_SHA"
           test -z "$(git status --porcelain)"
@@ -88,24 +94,51 @@ jobs:
           git merge-base --is-ancestor "$SOURCE_SHA" origin/main
           echo "Building merged Summit source commit: $actual_sha"
 
+      - name: Sign in to Azure with repository workload identity
+        uses: azure/login@2035af27c2cea8ff426397d10e3edb28906b51df # v2.3.1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sign in to Summit ACR with workload identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          acr_name="${ACR_LOGIN_SERVER%%.*}"
+          acr_token="$(az acr login --name "$acr_name" --expose-token --query accessToken --output tsv)"
+          test -n "$acr_token"
+          printf '%s' "$acr_token" | docker login "$ACR_LOGIN_SERVER" \
+            --username 00000000-0000-0000-0000-000000000000 \
+            --password-stdin
+          unset acr_token
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
 
-      - name: Log in to fork GHCR namespace
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+      - name: Generate source CycloneDX SBOM
+        uses: anchore/sbom-action@006b7ce8314066bdf1765b4500370d40fa6917a3 # v0.24.2
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
+          path: .
+          format: cyclonedx-json
+          output-file: source-sbom.cdx.json
+          upload-artifact: false
 
-      - name: Build and push immutable linux/amd64 image
+      - name: Upload source SBOM
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: itglue-source-sbom-${{ env.SOURCE_SHA }}
+          path: source-sbom.cdx.json
+          if-no-files-found: error
+
+      - name: Build and push immutable linux/amd64 ACR image
         id: build
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           platforms: linux/amd64
           push: true
-          tags: ${{ env.IMAGE }}:${{ env.IMAGE_TAG }}
+          tags: ${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_REPOSITORY }}:${{ env.IMAGE_TAG }}
           labels: |
             org.opencontainers.image.source=https://github.com/DDePuy2015/itglue-mcp
             org.opencontainers.image.revision=${{ env.SOURCE_SHA }}
@@ -113,22 +146,101 @@ jobs:
           sbom: true
           provenance: mode=max
 
-      - name: Scan published image for fixable critical and high CVEs
-        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
-        with:
-          image-ref: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
-          vuln-type: os,library
-          severity: CRITICAL,HIGH
-          ignore-unfixed: true
-          exit-code: '1'
-
-      - name: Report immutable image and attestations
+      - name: Set immutable image reference
         shell: bash
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           set -euo pipefail
           test -n "$DIGEST"
-          docker buildx imagetools inspect "$IMAGE@$DIGEST"
-          echo "Published immutable reference: $IMAGE@$DIGEST"
-          echo "BuildKit SBOM and max-mode provenance were requested for this digest."
+          echo "IMAGE_REF=${ACR_LOGIN_SERVER}/${IMAGE_REPOSITORY}@${DIGEST}" >> "$GITHUB_ENV"
+          echo "Published immutable ACR digest: ${DIGEST}"
+
+      - name: Generate registry image CycloneDX SBOM
+        uses: anchore/sbom-action@006b7ce8314066bdf1765b4500370d40fa6917a3 # v0.24.2
+        with:
+          image: ${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_REPOSITORY }}@${{ steps.build.outputs.digest }}
+          format: cyclonedx-json
+          output-file: image-sbom.cdx.json
+          upload-artifact: false
+
+      - name: Upload image SBOM
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: itglue-image-sbom-${{ env.SOURCE_SHA }}
+          path: image-sbom.cdx.json
+          if-no-files-found: error
+
+      - name: Scan published ACR image
+        id: image-scan
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        with:
+          image-ref: ${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_REPOSITORY }}@${{ steps.build.outputs.digest }}
+          format: table
+          output: trivy-image.txt
+          scanners: vuln,secret
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: '1'
+
+      - name: Upload image scan report
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: itglue-image-scan-${{ env.SOURCE_SHA }}
+          path: trivy-image.txt
+          if-no-files-found: warn
+
+      - name: Enforce image scan policy
+        if: steps.image-scan.outcome == 'failure'
+        run: exit 1
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.9.2
+
+      - name: Sign image by digest with keyless Sigstore identity
+        run: cosign sign --yes "$IMAGE_REF"
+
+      - name: Attach CycloneDX SBOM attestation
+        run: cosign attest --yes --predicate image-sbom.cdx.json --type cyclonedx "$IMAGE_REF"
+
+      - name: Verify signature and SBOM attestation
+        shell: bash
+        env:
+          SIGNER_IDENTITY: https://github.com/DDePuy2015/itglue-mcp/.github/workflows/fork-image-publish.yml@refs/heads/main
+        run: |
+          set -euo pipefail
+          cosign verify "$IMAGE_REF" \
+            --certificate-identity "$SIGNER_IDENTITY" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com
+          cosign verify-attestation "$IMAGE_REF" \
+            --type cyclonedx \
+            --certificate-identity "$SIGNER_IDENTITY" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com
+
+      - name: Inspect immutable registry reference
+        run: docker buildx imagetools inspect "$IMAGE_REF"
+
+      - name: Record immutable build metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "source_commit=${SOURCE_SHA}"
+            echo "image=${ACR_LOGIN_SERVER}/${IMAGE_REPOSITORY}"
+            echo "digest=${IMAGE_REF##*@}"
+            echo "workflow=${GITHUB_WORKFLOW}"
+            echo "run_id=${GITHUB_RUN_ID}"
+          } > image-metadata.txt
+
+      - name: Upload immutable build metadata
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: itglue-image-metadata-${{ env.SOURCE_SHA }}
+          path: |
+            image-metadata.txt
+            source-sbom.cdx.json
+            image-sbom.cdx.json
+            trivy-image.txt
+          if-no-files-found: error
