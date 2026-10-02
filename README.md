@@ -13,6 +13,15 @@ A Model Context Protocol (MCP) server that provides Claude with access to IT Glu
 > configuration; the Summit Azure deployment continues to use its own
 > immutable ACR image reference.
 
+> [!NOTE]
+> In the Summit-controlled fork, pull requests and pushes to `main` run
+> validation only. Container publication is a deliberate manual action through
+> the Summit ACR publisher, which re-runs the validation gates and requires the
+> exact merged commit SHA plus an explicit confirmation. Use its immutable ACR
+> full-merge-SHA image reference and recorded digest for Summit deployments;
+> the upstream `ghcr.io/wyre-ai/itglue-mcp` examples below refer to the public
+> upstream distribution.
+
 ## One-Click Deployment
 
 [![Deploy to DO](https://www.deploytodo.com/do-btn-blue.svg)](https://cloud.digitalocean.com/apps/new?repo=https://github.com/WYRE-AI/itglue-mcp/tree/main)
