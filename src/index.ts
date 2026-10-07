@@ -45,10 +45,12 @@ export {
   documentBodyOmittedNote,
   folderedDocumentsIncludedNote,
   listDocumentFoldersViaApiKey,
+  nameFallbackNote,
   parseITGlueDocumentUrl,
   parseFolderReference,
   requestDocumentsWithFolderDefault,
   rootLevelDocumentsNote,
+  searchByNameWithFallback,
   stripDocumentBodies,
   stripPasswordValues,
 } from "./mcp-server.js";
@@ -57,6 +59,7 @@ export type {
   GatewayCredentials,
   ITGlueDocumentUrlReference,
   ITGlueRegion,
+  NameFallbackResult,
 } from "./mcp-server.js";
 
 /**

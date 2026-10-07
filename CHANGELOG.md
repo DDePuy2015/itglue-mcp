@@ -125,6 +125,15 @@
 
 ### Fixed
 
+- **Partial organization and document name searches:** adapted upstream
+  [`40c2c25`](https://github.com/WYRE-AI/itglue-mcp/commit/40c2c25036e437be8b4802b98b6b2e73a307f384).
+  When IT Glue's exact `filter[name]` query is empty, search up to five pages
+  of 1,000 records using case-insensitive substring matching, retaining all
+  other filters, organization/folder scope, and requested result pagination.
+  Responses identify the fallback and warn when its scan is incomplete.
+  Document scope notes reflect the fallback's actual folder handling, and
+  document bodies remain omitted from search results.
+
 - **`search_documents` no longer inlines document bodies, which made foldered
   organizations hang.** ([#55](https://github.com/wyre-technology/itglue-mcp/issues/55))
   IT Glue's documents LIST endpoint embeds each document's full sectioned body
