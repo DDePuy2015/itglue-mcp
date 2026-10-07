@@ -2,6 +2,13 @@
 
 ### Security
 
+- Updated the production MCP SDK to 1.31.0 and transitive `proxy-addr` to
+  2.0.8 for GHSA-6qxp-vccf-f47h and GHSA-jqcg-44mw-7w3h. Added installed-package
+  regression canaries for OAuth issuer binding and IPv4/IPv6 proxy trust.
+  The shipped server entrypoints do not use the affected OAuth-client or
+  Express trust-proxy features; this removes vulnerable dependency versions
+  without changing application authentication or routing.
+
 - **Cross-tenant elicitation/confirmation misroute (gateway mode).** The
   "server reference" used by elicitation helpers (`src/utils/elicitation.ts`
   — `elicitSelection` / `elicitText` / `elicitConfirmation`) was stored in a
