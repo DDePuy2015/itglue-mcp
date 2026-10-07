@@ -812,6 +812,121 @@ export async function requestDocumentsWithFolderDefault(
 }
 
 /**
+ * IT Glue page size cap, used as the fetch size for
+ * {@link searchByNameWithFallback}'s broad listing.
+ */
+const NAME_FALLBACK_PAGE_SIZE = 1000;
+
+/**
+ * Max IT Glue pages {@link searchByNameWithFallback} will walk before giving
+ * up, so a name that matches nothing doesn't walk an entire multi-thousand
+ * -record account one page at a time.
+ */
+const NAME_FALLBACK_MAX_PAGES = 5;
+
+/**
+ * Result of a {@link searchByNameWithFallback} client-side substring search.
+ *
+ * `data` and `meta` describe the CALLER's requested page — not the
+ * underlying IT Glue fetch. Matches are accumulated across the fallback's own
+ * (up to NAME_FALLBACK_MAX_PAGES) requests, at NAME_FALLBACK_PAGE_SIZE each,
+ * before `data` is sliced down to the caller's `page.size`/`page.number` and
+ * `meta` (currentPage/nextPage/prevPage/totalPages/totalCount) is computed
+ * over that accumulated match set, exactly as if it had come back from IT
+ * Glue directly.
+ */
+export interface NameFallbackResult {
+  /** The caller's requested page of matches — already sliced, ready to return as-is. */
+  data: unknown[];
+  /** Pagination over the accumulated matches (not over the underlying IT Glue pages fetched to find them). */
+  meta: PaginationMeta;
+  /**
+   * True when the underlying listing hit NAME_FALLBACK_MAX_PAGES while a
+   * page still reported a `nextPage` — i.e. the search gave up before
+   * exhausting the resource, so `meta.totalCount` (and therefore `data`) may
+   * be missing matches that exist beyond the pages actually walked.
+   */
+  capped: boolean;
+}
+
+/**
+ * Client-side "contains" search for a resource whose IT Glue `filter[name]`
+ * is exact-match only.
+ *
+ * Organizations and Documents match `filter[name]` exactly rather than
+ * partially, unlike most other IT Glue resources (Configurations, Locations,
+ * Passwords) whose `filter[name]` genuinely does a case-insensitive contains
+ * match. Callers should therefore try the cheap, correct path first — send
+ * `filter[name]` as-is, which is fast and right whenever the caller already
+ * has the exact name — and only reach for this when that comes back empty.
+ *
+ * This walks `fetchPage` at the maximum IT Glue page size, matching `name`
+ * case-insensitively as a substring, until a page reports no `nextPage` or
+ * NAME_FALLBACK_MAX_PAGES is reached (`capped: true` in the latter case — the
+ * result may be incomplete). The caller's requested page is then sliced out
+ * of the accumulated matches, so pagination behaves the same as any other
+ * search result from the tool's perspective.
+ */
+export async function searchByNameWithFallback(
+  fetchPage: (page: {
+    size: number;
+    number: number;
+  }) => Promise<{ data: unknown[]; meta: PaginationMeta }>,
+  name: string,
+  page: { size: number; number: number }
+): Promise<NameFallbackResult> {
+  const needle = name.toLowerCase();
+  const matches: unknown[] = [];
+  let capped = false;
+
+  for (let pageNumber = 1; pageNumber <= NAME_FALLBACK_MAX_PAGES; pageNumber++) {
+    const result = await fetchPage({ size: NAME_FALLBACK_PAGE_SIZE, number: pageNumber });
+    for (const item of result.data) {
+      const itemName = (item as { name?: unknown } | null)?.name;
+      if (typeof itemName === "string" && itemName.toLowerCase().includes(needle)) {
+        matches.push(item);
+      }
+    }
+    if (!result.meta.nextPage) break;
+    if (pageNumber === NAME_FALLBACK_MAX_PAGES) capped = true;
+  }
+
+  const totalCount = matches.length;
+  const totalPages = Math.max(1, Math.ceil(totalCount / page.size));
+  const start = (page.number - 1) * page.size;
+
+  return {
+    data: matches.slice(start, start + page.size),
+    meta: {
+      currentPage: page.number,
+      nextPage: page.number < totalPages ? page.number + 1 : null,
+      prevPage: page.number > 1 ? page.number - 1 : null,
+      totalPages,
+      totalCount,
+    },
+    capped,
+  };
+}
+
+/**
+ * Advisory note attached when {@link searchByNameWithFallback} produced the
+ * result, so the model doesn't mistake a client-side substring match (and a
+ * possibly-capped one) for IT Glue's own search.
+ */
+export function nameFallbackNote(resource: string, name: string, capped: boolean): string {
+  return (
+    `NOTE: IT Glue's filter[name] matches ${resource} EXACTLY, not partially, so the exact-match ` +
+    `query for "${name}" returned nothing and this result comes from a client-side, case-insensitive ` +
+    `substring match instead.` +
+    (capped
+      ? ` The underlying scan was capped at ${NAME_FALLBACK_MAX_PAGES} pages ` +
+        `(up to ${NAME_FALLBACK_MAX_PAGES * NAME_FALLBACK_PAGE_SIZE} records). ` +
+        `Pagination totals describe only matches in the scanned pages; further matches may be missing.`
+      : "")
+  );
+}
+
+/**
  * Enumerate an organization's document folders using API-key auth.
  *
  * IT Glue's public API now documents a Document Folders resource, but the
@@ -1835,19 +1950,40 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         if (Object.keys(filter).length > 0) params.filter = filter;
         if (args?.sort) params.sort = args.sort;
-        params.page = {
+        const page = {
           size: (args?.page_size as number) || 50,
           number: (args?.page_number as number) || 1,
         };
+        params.page = page;
 
-        const result = await client.request("/organizations", params);
+        let result = await client.request("/organizations", params);
+        let note: string | null = null;
+
+        // IT Glue's filter[name] matches organizations exactly, not
+        // partially. The query above is the cheap, correct path whenever the
+        // caller already has the exact name; only when it comes back empty
+        // do we fall back to a broader, unfiltered listing matched
+        // client-side as a substring (see searchByNameWithFallback).
+        // An empty out-of-range page is not an empty exact-match set.
+        if (orgName && result.data.length === 0 && result.meta.totalCount === 0) {
+          const { name: _droppedNameFilter, ...otherFilters } = filter;
+          const fallback = await searchByNameWithFallback(
+            (fallbackPage) =>
+              client.request<unknown>("/organizations", {
+                ...(Object.keys(otherFilters).length > 0 ? { filter: otherFilters } : {}),
+                ...(args?.sort ? { sort: args.sort } : {}),
+                page: fallbackPage,
+              }),
+            orgName,
+            page
+          );
+          result = { data: fallback.data, meta: fallback.meta };
+          note = nameFallbackNote("organizations", orgName, fallback.capped);
+        }
+
+        const text = [note, JSON.stringify(result, null, 2)].filter(Boolean).join("\n\n");
         return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(result, null, 2),
-            },
-          ],
+          content: [{ type: "text", text }],
         };
       }
 
@@ -2190,18 +2326,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           };
         }
 
+        const docName = args?.name as string | undefined;
         const params: Record<string, unknown> = {};
         const filter: Record<string, unknown> = {};
 
-        if (args?.name) filter.name = args.name;
+        if (docName) filter.name = docName;
         if (args?.document_folder_id) filter.documentFolderId = args.document_folder_id;
 
         if (Object.keys(filter).length > 0) params.filter = filter;
         if (args?.sort) params.sort = args.sort;
-        params.page = {
+        const page = {
           size: (args?.page_size as number) || 50,
           number: (args?.page_number as number) || 1,
         };
+        params.page = page;
 
         try {
           let result: { data: unknown[]; meta: PaginationMeta };
@@ -2233,12 +2371,72 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 : folderedDocumentsIncludedNote();
           }
 
+          // IT Glue's filter[name] matches documents exactly, not partially.
+          // The query above is the cheap, correct path whenever the caller
+          // already has the exact name; only when it comes back empty do we
+          // fall back to a broader listing matched client-side as a
+          // substring (see searchByNameWithFallback).
+          let nameNote: string | null = null;
+          // Preserve exact-match pagination when matches exist on other pages.
+          if (docName && result.data.length === 0 && result.meta.totalCount === 0) {
+            // Each fallback page re-negotiates the folder filter independently
+            // (see requestDocumentsWithFolderDefault) — capture every page's
+            // attempt so the scope note below describes what actually
+            // produced `result`, not the (now-discarded) primary attempt.
+            const fallbackAttempts: DocumentSearchAttempt[] = [];
+            const fallback = await searchByNameWithFallback(
+              (fallbackPage) =>
+                (args?.document_folder_id
+                  ? client.request<unknown>(
+                      `/organizations/${args.organization_id}/relationships/documents`,
+                      {
+                        filter: { documentFolderId: args.document_folder_id },
+                        ...(args?.sort ? { sort: args.sort } : {}),
+                        page: fallbackPage,
+                      }
+                    )
+                  : requestDocumentsWithFolderDefault(
+                      client,
+                      args.organization_id as number | string,
+                      { ...(args?.sort ? { sort: args.sort } : {}), page: fallbackPage }
+                    ).then((attempted) => {
+                      fallbackAttempts.push(attempted.attempt);
+                      return attempted.result;
+                    })).then((listed) => ({
+                      ...listed,
+                      // Do not retain full document bodies across the scan.
+                      data: stripDocumentBodies(listed.data),
+                    })),
+              docName,
+              page
+            );
+            result = { data: fallback.data, meta: fallback.meta };
+            nameNote = nameFallbackNote("documents", docName, fallback.capped);
+
+            if (!args?.document_folder_id) {
+              const rootOnly = fallbackAttempts.includes("unfiltered");
+              const folderInclusive = fallbackAttempts.some((attempt) => attempt !== "unfiltered");
+              note = rootOnly && folderInclusive
+                ? "NOTE: some fallback pages were limited to ROOT-LEVEL documents after the " +
+                  "folder-inclusive filters were rejected. Other pages included foldered documents, " +
+                  "so folder coverage is incomplete and pagination totals may omit matches. " +
+                  "Use list_document_folders and search_documents with document_folder_id to " +
+                  "search each folder explicitly."
+                : rootOnly
+                  ? rootLevelDocumentsNote({
+                      folderFiltered: false,
+                      haveJwt: Boolean(sessionJwt ?? credentials.jwt),
+                    })
+                  : folderedDocumentsIncludedNote();
+            }
+          }
+
           // Drop each document's full body — search_documents is a list tool,
           // and IT Glue's list endpoint inlines the entire sectioned body per
           // document, which can balloon the response past the client's limit
           // (issue #55). Bodies stay available via get_document.
           const trimmed = { ...result, data: stripDocumentBodies(result.data) };
-          const text = [documentBodyOmittedNote(), note, JSON.stringify(trimmed, null, 2)]
+          const text = [documentBodyOmittedNote(), nameNote, note, JSON.stringify(trimmed, null, 2)]
             .filter(Boolean)
             .join("\n\n");
           return {
