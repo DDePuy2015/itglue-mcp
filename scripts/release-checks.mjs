@@ -56,13 +56,19 @@ export function verifyOci(directory, sourceSha, expectedDigest) {
   visit(root);
   const runnable = manifests.filter(item => item.config.os === 'linux' && item.config.architecture === 'amd64');
   assert.equal(runnable.length, 1, 'exactly one linux/amd64 image required');
-  assert.equal(manifests.filter(item => item.config.os !== 'unknown' || item.config.architecture !== 'unknown').length, 1, 'additional unscanned platforms forbidden');
   const image = runnable[0];
   assert.equal(image.config.config?.Labels?.['org.opencontainers.image.revision'], sourceSha, 'image revision mismatch');
   assert.equal(image.config.config?.Labels?.['org.opencontainers.image.source'], REPOSITORY, 'image repository mismatch');
   assert.equal(image.config.config?.User, 'mcp');
   assert.deepEqual(image.config.config?.Cmd, ['node', 'dist/index.js']);
-  const attestations = manifests.filter(item => item.descriptor.annotations?.['vnd.docker.reference.digest'] === image.descriptor.digest);
+  const attestations = manifests.filter(item => item !== image);
+  for (const item of attestations) {
+    // BuildKit attestation config blobs can omit os/architecture entirely.
+    // Classify by the linked descriptor and in-toto-only layers, not config.
+    assert.equal(item.descriptor.annotations?.['vnd.docker.reference.type'], 'attestation-manifest', 'additional unscanned image forbidden');
+    assert.equal(item.descriptor.annotations?.['vnd.docker.reference.digest'], image.descriptor.digest, 'attestation image linkage mismatch');
+    assert.ok(item.document.layers.length && item.document.layers.every(layer => layer.mediaType === 'application/vnd.in-toto+json'), 'unexpected attestation layer');
+  }
   const statements = attestations.flatMap(item => item.document.layers.map(layer => JSON.parse(blob(layer))));
   const provenance = statements.filter(statement => statement.predicateType === PROVENANCE_TYPE);
   assert.equal(provenance.length, 1, 'one BuildKit provenance statement required');

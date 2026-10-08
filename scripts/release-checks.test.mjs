@@ -51,8 +51,8 @@ function ociFixture({ includeSbom = true, revision = sha } = {}) {
   const statement = (predicateType, predicate) => blob({ _type: 'https://in-toto.io/Statement/v0.1', predicateType, subject: [{ name: 'image', digest: { sha256: image.digest.slice(7) } }], predicate }, 'application/vnd.in-toto+json');
   const layers = [statement(PROVENANCE_TYPE, provenance())];
   if (includeSbom) layers.push(statement('https://spdx.dev/Document', { spdxVersion: 'SPDX-2.3' }));
-  const attestation = blob({ config: blob({ architecture: 'unknown', os: 'unknown' }), layers });
-  attestation.annotations = { 'vnd.docker.reference.digest': image.digest };
+  const attestation = blob({ config: blob({}), layers });
+  attestation.annotations = { 'vnd.docker.reference.digest': image.digest, 'vnd.docker.reference.type': 'attestation-manifest' };
   const root = blob({ schemaVersion: 2, manifests: [image, attestation] }, 'application/vnd.oci.image.index.v1+json');
   writeFileSync(join(directory, 'index.json'), JSON.stringify({ manifests: [root] }));
   return { directory, root, config, image };

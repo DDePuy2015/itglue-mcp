@@ -138,6 +138,10 @@ jobs:
           set -euo pipefail
           sudo apt-get update -qq
           sudo apt-get install -y skopeo
+          # Exercise the publisher's all-manifest transfer locally, with no
+          # registry credentials or writes, before loading the runnable image.
+          skopeo copy --all --preserve-digests --digestfile "$RUNNER_TEMP/transfer-digest.txt" "oci-archive:$EVIDENCE/image.tar" "oci:$RUNNER_TEMP/transfer-check:validated"
+          test "$(cat "$RUNNER_TEMP/transfer-digest.txt")" = "$(jq -r .digest "$EVIDENCE/image-metadata.json")"
           skopeo --override-os linux --override-arch amd64 copy "oci-archive:$EVIDENCE/image.tar" "docker-daemon:$LOCAL_IMAGE"
           test "$(docker image inspect "$LOCAL_IMAGE" --format '{{.Id}}')" = "$(jq -r .configDigest "$EVIDENCE/image-metadata.json")"
 

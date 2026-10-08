@@ -70,7 +70,8 @@ caller. No private Ops reusable workflow is called from this public repository.
 This change documents prerequisites; it does not create identities, credentials,
 federation, role assignments, environments or repository settings.
 
-PR checks exercise the real local image/archive scans and provenance validation.
+PR checks exercise the real local image/archive scans, all-manifest transfer to
+a local OCI layout with digest preservation, and provenance validation.
 Release-helper tests use synthetic OCI and signed-envelope fixtures to test
 rejection paths. They do not establish live Azure federation, registry write,
 Sigstore service availability or actual certificate issuance. Validate those
