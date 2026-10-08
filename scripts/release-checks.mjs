@@ -110,6 +110,17 @@ export function summarizeScan(report) {
   }));
 }
 
+export function verifySourceSbom(document, lockfile) {
+  assert.equal(document.bomFormat, 'CycloneDX');
+  assert.ok(document.components?.length, 'empty source dependency inventory');
+  const packages = new Set(document.components.map(component => decodeURIComponent(component.purl ?? '')));
+  for (const [path, entry] of Object.entries(lockfile.packages ?? {})) {
+    if (!path || entry.dev || entry.devOptional || entry.optional || entry.link) continue;
+    const name = path.split('node_modules/').at(-1);
+    assert.ok(packages.has(`pkg:npm/${name}@${entry.version}`), `source SBOM missing production package: ${name}@${entry.version}`);
+  }
+}
+
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const [command, input, output] = process.argv.slice(2);
   if (command === 'guard') verifyPublishInputs(process.env);
@@ -119,6 +130,8 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     writeFileSync(resolve(output, 'verified-provenance.json'), JSON.stringify(result.provenance, null, 2));
   } else if (command === 'scan-summary') {
     writeFileSync(output, JSON.stringify(summarizeScan(JSON.parse(readFileSync(input, 'utf8'))), null, 2));
+  } else if (command === 'source-sbom') {
+    verifySourceSbom(JSON.parse(readFileSync(input, 'utf8')), JSON.parse(readFileSync('package-lock.json', 'utf8')));
   } else if (command === 'signed-provenance' || command === 'signed-sbom') {
     verifySignedAttestation(readFileSync(input, 'utf8'), command === 'signed-provenance' ? PROVENANCE_TYPE : 'https://cyclonedx.org/bom', process.env.SOURCE_SHA, process.env.DIGEST, JSON.parse(readFileSync(output, 'utf8')));
   } else throw new Error('Unknown release-check command');

@@ -7,6 +7,11 @@ vulnerability checks, runtime alignment, and source/image SBOM generation.
 as workflow artifacts. Existing CI, MCP assertion, Semgrep and fork release
 guard checks retain their names.
 
+The source SBOM includes the installed build dependency graph and must contain
+every non-optional production package/version from the lockfile. Empty or
+incomplete production inventories fail validation. Dependency audit policy
+remains scoped to production; build dependencies are recorded for traceability.
+
 The validation job builds one `linux/amd64` OCI archive with BuildKit maximum
 provenance and SPDX SBOM attestations. It verifies the complete content-addressed
 blob graph, source revision, repository and provenance, then loads that archive

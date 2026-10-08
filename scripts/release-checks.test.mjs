@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { PROVENANCE_TYPE, REPOSITORY, verifyPublishInputs, verifyOci, verifyProvenance, verifySignedAttestation, summarizeScan } from './release-checks.mjs';
+import { PROVENANCE_TYPE, REPOSITORY, verifyPublishInputs, verifyOci, verifyProvenance, verifySignedAttestation, summarizeScan, verifySourceSbom } from './release-checks.mjs';
 
 const sha = 'a'.repeat(40);
 const digest = `sha256:${'b'.repeat(64)}`;
@@ -97,4 +97,13 @@ test('scan evidence excludes matched secrets, paths and source excerpts', () => 
   assert.ok(!output.includes('private-content'));
   assert.ok(!output.includes('private-path'));
   assert.ok(output.includes('CVE-fixture'));
+});
+
+test('source SBOM rejects empty inventories and missing or substituted production packages', () => {
+  const lock = { packages: { '': {}, 'node_modules/@fixture/sdk': { version: '1.0.0' }, 'node_modules/transitive': { version: '2.0.0' }, 'node_modules/build-only': { version: '3.0.0', dev: true } } };
+  const valid = { bomFormat: 'CycloneDX', components: [{ purl: 'pkg:npm/%40fixture/sdk@1.0.0' }, { purl: 'pkg:npm/transitive@2.0.0' }] };
+  verifySourceSbom(valid, lock);
+  assert.throws(() => verifySourceSbom({ ...valid, components: [] }, lock));
+  assert.throws(() => verifySourceSbom({ ...valid, components: valid.components.slice(0, 1) }, lock));
+  assert.throws(() => verifySourceSbom({ ...valid, components: [{ purl: 'pkg:npm/%40fixture/sdk@0.0.1' }, valid.components[1]] }, lock));
 });
