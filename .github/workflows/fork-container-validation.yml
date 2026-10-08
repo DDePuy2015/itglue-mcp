@@ -1,10 +1,10 @@
 name: Fork Container Validation
 
-# Read-only validation for the Summit fork. This workflow deliberately does
-# not create a release, publish to the MCP Registry, push an image, or deploy
-# to Azure. It is also callable by the manual publisher so the exact source
-# checks and runtime gates run before a GHCR push.
+# PR/main checks have read-only credentials. The manual publisher consumes the
+# same scanned OCI archive; validation never pushes to a registry or deploys.
 on:
+  push:
+    branches: [main]
   pull_request:
     branches: [main]
   workflow_call:
@@ -17,6 +17,13 @@ on:
         description: Local-only image tag used for runtime validation
         required: false
         type: string
+    outputs:
+      image_digest:
+        description: Digest of the scanned attested OCI index
+        value: ${{ jobs.validate.outputs.image_digest }}
+      artifact_name:
+        description: Same-run artifact containing the scanned image and evidence
+        value: ${{ jobs.validate.outputs.artifact_name }}
 
 permissions:
   contents: read
@@ -26,10 +33,13 @@ jobs:
   validate:
     name: Validate source and runtime image
     runs-on: ubuntu-latest
+    outputs:
+      image_digest: ${{ steps.build.outputs.digest }}
+      artifact_name: ${{ steps.evidence.outputs.artifact_name }}
     env:
-      EXPECTED_SHA: ${{ inputs.source_sha || github.event.pull_request.head.sha }}
-      LOCAL_IMAGE: ${{ inputs.image_tag || format('itglue-mcp:pr-{0}', github.event.pull_request.number) }}
-      NODE_AUTH_TOKEN: ${{ github.token }}
+      EXPECTED_SHA: ${{ inputs.source_sha || github.event.pull_request.head.sha || github.sha }}
+      LOCAL_IMAGE: ${{ inputs.image_tag || format('itglue-mcp:{0}', github.sha) }}
+      EVIDENCE: /tmp/itglue-evidence
 
     steps:
       - name: Checkout exact source commit
@@ -44,17 +54,15 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]
-          actual_sha="$(git rev-parse HEAD)"
-          test "$actual_sha" = "$EXPECTED_SHA"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
           test -z "$(git status --porcelain)"
-          echo "Validated source commit: $actual_sha"
+          mkdir -p "$EVIDENCE"
 
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 26.x
           cache: npm
-          registry-url: https://npm.pkg.github.com
 
       - name: Install dependencies
         run: npm ci --ignore-scripts
@@ -67,66 +75,132 @@ jobs:
           npm run typecheck
           npm test
           npm run build
+          node --test scripts/release-checks.test.mjs
           git diff --check
 
-      - name: Run dependency and source secret scans
-        shell: bash
+      - name: Run production dependency audit
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: Scan tracked source for secrets
+        id: source-scan
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: secret
+          skip-dirs: node_modules,dist,.git
+          format: json
+          output: ${{ runner.temp }}/source-scan.json
+          exit-code: '1'
+
+      - name: Retain sanitized source scan and enforce policy
+        if: ${{ always() && steps.source-scan.outcome != 'skipped' }}
+        env:
+          SCAN_OUTCOME: ${{ steps.source-scan.outcome }}
         run: |
           set -euo pipefail
-          npm audit --omit=dev --audit-level=high
-          if git grep -nEI -e '-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----|(^|[^A-Za-z])(ghp_|github_pat_|glpat-|xox[baprs]-|AKIA|ASIA)[A-Za-z0-9_-]{10,}' -- ':!package-lock.json'; then
-            echo "Potential credential material found in tracked source." >&2
-            exit 1
-          fi
+          node scripts/release-checks.mjs scan-summary "$RUNNER_TEMP/source-scan.json" "$EVIDENCE/source-scan-summary.json"
+          test "$SCAN_OUTCOME" = success
 
       - name: Generate CycloneDX source SBOM
-        shell: bash
-        run: |
-          set -euo pipefail
-          npm sbom --sbom-format cyclonedx --omit=dev > "$RUNNER_TEMP/itglue-source-sbom.cdx.json"
-          test -s "$RUNNER_TEMP/itglue-source-sbom.cdx.json"
+        run: npm sbom --sbom-format cyclonedx --omit=dev > "$EVIDENCE/source-sbom.cdx.json"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
 
-      - name: Build image without pushing
+      - name: Build attested OCI archive without pushing
+        id: build
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           platforms: linux/amd64
-          load: true
           push: false
+          outputs: type=oci,dest=${{ env.EVIDENCE }}/image.tar
           tags: ${{ env.LOCAL_IMAGE }}
           labels: |
             org.opencontainers.image.source=https://github.com/DDePuy2015/itglue-mcp
             org.opencontainers.image.revision=${{ env.EXPECTED_SHA }}
-          # The local Docker exporter cannot load a manifest list with
-          # attestations; the manual publisher attaches SBOM/provenance to the
-          # pushed digest after these same source gates pass.
+          sbom: true
+          provenance: mode=max,version=v0.2
 
-      - name: Scan local image for fixable critical and high CVEs
+      - name: Verify archive, provenance and image source
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          mkdir "$RUNNER_TEMP/oci"
+          tar -xf "$EVIDENCE/image.tar" -C "$RUNNER_TEMP/oci"
+          node scripts/release-checks.mjs oci "$RUNNER_TEMP/oci" "$EVIDENCE"
+
+      - name: Load the same archive for runtime and vulnerability checks
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y skopeo
+          skopeo --override-os linux --override-arch amd64 copy "oci-archive:$EVIDENCE/image.tar" "docker-daemon:$LOCAL_IMAGE"
+          test "$(docker image inspect "$LOCAL_IMAGE" --format '{{.Id}}')" = "$(jq -r .configDigest "$EVIDENCE/image-metadata.json")"
+
+      - name: Scan exact local image for vulnerabilities and secrets
+        id: image-scan
+        continue-on-error: true
         uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
         with:
           image-ref: ${{ env.LOCAL_IMAGE }}
+          scanners: vuln,secret
           vuln-type: os,library
           severity: CRITICAL,HIGH
           ignore-unfixed: true
+          format: json
+          output: ${{ runner.temp }}/image-scan.json
           exit-code: '1'
+
+      - name: Retain sanitized image scan and enforce policy
+        if: ${{ always() && steps.image-scan.outcome != 'skipped' }}
+        env:
+          SCAN_OUTCOME: ${{ steps.image-scan.outcome }}
+        run: |
+          set -euo pipefail
+          node scripts/release-checks.mjs scan-summary "$RUNNER_TEMP/image-scan.json" "$EVIDENCE/image-scan-summary.json"
+          test "$SCAN_OUTCOME" = success
+
+      - name: Generate exact image CycloneDX SBOM
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        with:
+          image-ref: ${{ env.LOCAL_IMAGE }}
+          format: cyclonedx
+          output: ${{ env.EVIDENCE }}/image-sbom.cdx.json
 
       - name: Verify image runtime alignment
         shell: bash
         run: |
           set -euo pipefail
-          metadata="$(docker image inspect "$LOCAL_IMAGE")"
-          echo "$metadata" | jq -e '
-            .[0]
-            | .Architecture == "amd64"
-              and .Config.Cmd == ["node", "dist/index.js"]
-              and .Config.Entrypoint == ["docker-entrypoint.sh"]
-              and .Config.User == "mcp"
-          '
+          docker image inspect "$LOCAL_IMAGE" | jq -e '.[0] | .Architecture == "amd64" and .Config.Cmd == ["node", "dist/index.js"] and .Config.Entrypoint == ["docker-entrypoint.sh"] and .Config.User == "mcp"'
           runtime="$(docker run --rm --platform linux/amd64 --entrypoint node "$LOCAL_IMAGE" -e 'process.stdout.write(process.platform + "/" + process.arch)')"
-          test "$runtime" = "linux/x64"
+          test "$runtime" = linux/x64
           node_version="$(docker run --rm --platform linux/amd64 --entrypoint node "$LOCAL_IMAGE" -e 'process.stdout.write(process.versions.node)')"
           [[ "$node_version" =~ ^26\. ]]
           echo "Validated image runtime: $runtime, Node $node_version, user mcp, command node dist/index.js"
+
+      - name: Retain automatic validation evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: itglue-validation-${{ env.EXPECTED_SHA }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.EVIDENCE }}/*.json
+          if-no-files-found: warn
+
+      - name: Name scanned publication artifact
+        id: evidence
+        if: ${{ inputs.source_sha != '' }}
+        run: echo "artifact_name=itglue-scanned-image-$EXPECTED_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+
+      - name: Retain exact scanned image for manual publication
+        if: ${{ inputs.source_sha != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ steps.evidence.outputs.artifact_name }}
+          path: ${{ env.EVIDENCE }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
