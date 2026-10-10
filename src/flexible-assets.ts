@@ -397,7 +397,7 @@ async function fetchAssets(
   let totalPages: number | undefined;
   for (let fetched = 0; fetched < maxPages; fetched++, pageNumber++) {
     const result = await client.request<JsonRecord>("/flexible_assets", {
-      filter, sort: "id", page: { size: pageSize, number: pageNumber },
+      filter, sort: "created_at", page: { size: pageSize, number: pageNumber },
     });
     pagination.pagesFetched++;
     let invalidRecord = false;

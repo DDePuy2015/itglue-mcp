@@ -17,6 +17,7 @@ function mockAssets(page: (number: number, type: number) => { data: RecordData[]
     if (init.method === "POST") return jsonResponse(printerRecord(9999));
     if (parsed.pathname.endsWith("relationships/flexible_asset_fields")) return jsonResponse([], pageMeta(1, 1, 0));
     expect(parsed.pathname).toBe("/flexible_assets");
+    expect(parsed.searchParams.get("sort")).toBe("created_at");
     expect(parsed.searchParams.get("filter[organization-id]")).toBe("101");
     const result = page(Number(parsed.searchParams.get("page[number]")), Number(parsed.searchParams.get("filter[flexible-asset-type-id]")));
     return jsonResponse(result.data, result.meta);
