@@ -66,6 +66,15 @@ interface PaginationMeta {
   prevPage: number | null;
   totalPages: number;
   totalCount: number;
+  /** Defaults are compatibility values, not evidence of a complete listing. */
+  paginationUnknown?: true;
+}
+
+export const MAX_PAGE_SIZE = 1000;
+
+export function clampPageSize(value: unknown): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 1) return undefined;
+  return Math.min(Math.floor(value), MAX_PAGE_SIZE);
 }
 
 // Utility functions for JSON:API
@@ -297,7 +306,8 @@ export class ITGlueClient {
         }
       } else if (key === "page" && typeof value === "object") {
         const pageObj = value as { size?: number; number?: number };
-        if (pageObj.size) searchParams.append("page[size]", String(pageObj.size));
+        const pageSize = clampPageSize(pageObj.size);
+        if (pageSize !== undefined) searchParams.append("page[size]", String(pageSize));
         if (pageObj.number) searchParams.append("page[number]", String(pageObj.number));
       } else if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
         searchParams.append(key, String(value));
@@ -340,11 +350,15 @@ export class ITGlueClient {
       : [deserializeResource(json.data)];
 
     const meta: PaginationMeta = {
-      currentPage: json.meta?.["current-page"] || 1,
-      nextPage: json.meta?.["next-page"] || null,
-      prevPage: json.meta?.["prev-page"] || null,
-      totalPages: json.meta?.["total-pages"] || 1,
-      totalCount: json.meta?.["total-count"] || data.length,
+      currentPage: json.meta?.["current-page"] ?? 1,
+      nextPage: json.meta?.["next-page"] ?? null,
+      prevPage: json.meta?.["prev-page"] ?? null,
+      totalPages: json.meta?.["total-pages"] ?? 1,
+      totalCount: json.meta?.["total-count"] ?? data.length,
+      ...(!json.meta || !("next-page" in json.meta) ||
+        ["current-page", "total-pages", "total-count"].some(
+          (key) => typeof (json.meta as Record<string, unknown> | undefined)?.[key] !== "number"
+        ) ? { paginationUnknown: true as const } : {}),
     };
 
     return { data: data as T[], meta };
