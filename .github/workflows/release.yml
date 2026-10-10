@@ -8,7 +8,7 @@ on:
 # publish to the upstream GHCR namespace and MCP Registry through OIDC, and
 # upload security results. This fork keeps PR verification read-only; the
 # Summit-owned image path is available only through the separately reviewed,
-# manually approved GHCR-only publisher.
+# manually confirmed ACR publisher.
 permissions:
   contents: read
 
@@ -23,4 +23,4 @@ jobs:
           set -euo pipefail
           test "$GITHUB_REPOSITORY" = "DDePuy2015/itglue-mcp"
           echo "Upstream release, MCP Registry publication, OIDC, and automatic image publishing are disabled for this Summit fork."
-          echo "PR validation runs in fork-container-validation.yml; image publication requires the manual GHCR-only workflow."
+          echo "PR validation runs in fork-container-validation.yml; image publication requires the manual ACR workflow."
