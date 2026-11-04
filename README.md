@@ -160,6 +160,30 @@ If you do need the JWT fallback, provide it in whichever way matches your deploy
 - **Typed create/update tools** - Operators can create and update those five tenant-specific asset types after required-field, select-option, organization/type, and duplicate checks. Password, PSK, upload, and header fields are never accepted or returned.
 - **get_site_network_overview** - Read the WAN, LAN, and Wireless records for one organization in one response.
 
+Typed searches return one source page with `pagination` metadata. A `name`
+filter is a substring match within that page; `totalCount` describes the source
+listing, not the number of name matches. Continue with the same organization,
+name filter, and `page_size`, using `pagination.nextPage` as `page_number`.
+`complete` is true only when the result covers the entire source listing from
+page 1 with consistent pagination evidence. It does not assess documentation
+quality or whether every optional field is populated.
+
+Network overview reads up to five pages of 100 records for each network type.
+It preserves the existing per-type arrays and adds an aggregate `complete`
+flag and per-type `pagination`, including `searchTool`, `pageSize`, and
+`nextPage` for continuation through the corresponding typed search. A cap,
+missing metadata, repeated records, or inconsistent pages yields
+`complete: false` with a machine-readable reason. A failed type request returns
+a tool error rather than presenting that type as empty.
+
+Typed creates check existing composite identities across at most five pages
+of 1,000 records. They refuse to write when the scan is incomplete or identity
+fields cannot be read. Existing native relationship IDs and type-specific
+identities are preserved. This check cannot make a read-then-create operation
+atomic against other writers; IT Glue provides no transactional uniqueness
+guarantee here. All outbound page sizes are capped at 1,000; invalid sizes are
+omitted so the API can apply its default.
+
 The typed tools use the live tenant field definitions captured for Summit IT Glue.
 Generic flexible-asset search remains available for other types, but API Keys /
 Secret Keys (`393982`) are restricted to administrators and every field whose
