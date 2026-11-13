@@ -361,19 +361,102 @@ function identityMatches(schema: FlexibleAssetSchema, record: JsonRecord, values
   });
 }
 
+const ASSET_SCAN_MAX_PAGES = 5;
+
+interface AssetPagination {
+  complete: boolean;
+  reason: "complete" | "page_limit" | "page_window" | "missing_metadata" | "inconsistent_pagination";
+  pageSize: number;
+  startPage: number;
+  pagesFetched: number;
+  nextPage: number | null;
+  totalCount?: number;
+  totalPages?: number;
+}
+
+function positivePage(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : fallback;
+}
+
 async function fetchAssets(
   client: FlexibleAssetClient,
   schema: FlexibleAssetSchema,
   organizationId: number,
   pageSize = 100,
   pageNumber = 1,
-): Promise<JsonRecord[]> {
+  maxPages = 1,
+): Promise<{ data: JsonRecord[]; pagination: AssetPagination }> {
   const filter: JsonRecord = { flexibleAssetTypeId: schema.typeId, organizationId };
-  const result = await client.request<JsonRecord>("/flexible_assets", {
-    filter,
-    page: { size: pageSize, number: pageNumber },
-  });
-  return result.data;
+  const data: JsonRecord[] = [];
+  const ids = new Set<string>();
+  const pagination: AssetPagination = {
+    complete: false, reason: "page_limit", pageSize, startPage: pageNumber,
+    pagesFetched: 0, nextPage: pageNumber,
+  };
+  let totalCount: number | undefined;
+  let totalPages: number | undefined;
+  for (let fetched = 0; fetched < maxPages; fetched++, pageNumber++) {
+    const result = await client.request<JsonRecord>("/flexible_assets", {
+      filter, sort: "created_at", page: { size: pageSize, number: pageNumber },
+    });
+    pagination.pagesFetched++;
+    let invalidRecord = false;
+    for (const record of result.data.slice(0, pageSize)) {
+      const id = String(record.id ?? "");
+      const recordOrg = record.organizationId ?? record.organization_id;
+      const recordType = record.flexibleAssetTypeId ?? record.flexible_asset_type_id;
+      if (!id || ids.has(id) || (recordOrg !== undefined && Number(recordOrg) !== organizationId) ||
+          (recordType !== undefined && Number(recordType) !== schema.typeId)) {
+        invalidRecord = true;
+        break;
+      }
+      ids.add(id);
+      data.push(record);
+    }
+    if (invalidRecord) {
+      pagination.reason = "inconsistent_pagination";
+      pagination.nextPage = pageNumber;
+      break;
+    }
+    const meta = result.meta as JsonRecord | null;
+    // A short page is not completion evidence. The client may have supplied
+    // compatibility defaults for absent API metadata.
+    if (!meta || meta.paginationUnknown || ["currentPage", "nextPage", "totalPages", "totalCount"].some((key) => !(key in meta))) {
+      pagination.reason = "missing_metadata";
+      pagination.nextPage = null;
+      break;
+    }
+    const count = meta.totalCount as number;
+    const pages = meta.totalPages as number;
+    const expectedNext = pageNumber < pages ? pageNumber + 1 : null;
+    if (meta.currentPage !== pageNumber || !Number.isSafeInteger(count) || count < 0 ||
+        !Number.isSafeInteger(pages) || pages < 0 || (pages === 0 && count !== 0) ||
+        (pageNumber > Math.max(1, pages) && result.data.length !== 0) ||
+        meta.nextPage !== expectedNext || result.data.length > pageSize ||
+        (totalCount !== undefined && (count !== totalCount || pages !== totalPages)) ||
+        (result.data.length === 0 && (expectedNext !== null || (pageNumber <= pages && count > 0)))) {
+      pagination.reason = "inconsistent_pagination";
+      pagination.nextPage = pageNumber;
+      break;
+    }
+    totalCount = count;
+    totalPages = pages;
+    pagination.totalCount = count;
+    pagination.totalPages = pages;
+    pagination.nextPage = expectedNext;
+    if (data.length > count ||
+        (expectedNext === null && pagination.startPage === 1 && data.length !== count)) {
+      pagination.reason = "inconsistent_pagination";
+      pagination.nextPage = pageNumber;
+      break;
+    }
+    if (expectedNext === null) {
+      pagination.complete = pagination.startPage === 1;
+      pagination.reason = pagination.complete ? "complete" : "page_window";
+      break;
+    }
+  }
+  return { data, pagination };
 }
 
 async function fetchAsset(client: FlexibleAssetClient, schema: FlexibleAssetSchema, organizationId: number, id: number): Promise<JsonRecord> {
@@ -513,7 +596,7 @@ export function flexibleAssetToolDefinitions(): JsonRecord[] {
   for (const config of FLEXIBLE_ASSET_TOOL_CONFIGS) {
     const { schema } = config;
     tools.push(
-      { name: config.searchName, description: `Search ${schema.name} flexible assets in one IT Glue organization.`, inputSchema: { type: "object", properties: { ...baseProperties(), name: { type: "string" }, page_size: { type: "integer", minimum: 1, maximum: 1000 }, page_number: { type: "integer", minimum: 1 } }, required: ["organization_id"] } },
+      { name: config.searchName, description: `Search one page of ${schema.name} flexible assets in one IT Glue organization. Name matching is page-local; use pagination.nextPage to continue.`, inputSchema: { type: "object", properties: { ...baseProperties(), name: { type: "string" }, page_size: { type: "integer", minimum: 1, maximum: 1000 }, page_number: { type: "integer", minimum: 1 } }, required: ["organization_id"] } },
       { name: config.getName, description: `Read one ${schema.name} flexible asset. Password-kind fields are always omitted.`, inputSchema: { type: "object", properties: { ...baseProperties(), id: { type: "integer", minimum: 1 } }, required: ["organization_id", "id"] } },
       { name: config.createName, description: `Create a ${schema.name} flexible asset using the approved tenant schema. Duplicate identities are rejected.`, inputSchema: { type: "object", properties: { ...baseProperties(), fields: fieldsInputSchema(schema, true) }, required: ["organization_id", "fields"] } },
       { name: config.updateName, description: `Update an existing ${schema.name} flexible asset. Password-kind fields and uploads are unavailable.`, inputSchema: { type: "object", properties: { ...baseProperties(), id: { type: "integer", minimum: 1 }, fields: fieldsInputSchema(schema, false) }, required: ["organization_id", "id", "fields"] } },
@@ -521,7 +604,7 @@ export function flexibleAssetToolDefinitions(): JsonRecord[] {
   }
   tools.push({
     name: "get_site_network_overview",
-    description: "Return normalized WAN, LAN, and Wireless flexible-asset records for one IT Glue organization. Password fields are omitted.",
+    description: "Return normalized WAN, LAN, and Wireless flexible-asset records for one IT Glue organization, up to five pages of 100 per type. Check complete and per-type pagination for continuation. Password fields are omitted.",
     inputSchema: { type: "object", properties: baseProperties(), required: ["organization_id"] },
   });
   return tools;
@@ -544,12 +627,16 @@ export async function handleFlexibleAssetTool(name: string, args: JsonRecord, cl
     try {
       const organizationId = numberId(args.organization_id, "organization_id");
       const results: JsonRecord = { organizationId };
+      const pagination: JsonRecord = {};
+      let complete = true;
       for (const config of FLEXIBLE_ASSET_TOOL_CONFIGS.slice(2)) {
         const schema = await liveSchema(client, config.schema);
-        const records = await fetchAssets(client, schema, organizationId);
-        results[schema.name] = records.map((record) => normalizeRecord(redactRecord(record, schema.fields), schema));
+        const records = await fetchAssets(client, schema, organizationId, 100, 1, ASSET_SCAN_MAX_PAGES);
+        results[schema.name] = records.data.map((record) => normalizeRecord(redactRecord(record, schema.fields), schema));
+        pagination[schema.name] = { ...records.pagination, searchTool: config.searchName };
+        complete &&= records.pagination.complete;
       }
-      return textResult(results);
+      return textResult({ ...results, complete, pagination });
     } catch (error) {
       return errorResult(error instanceof Error ? error.message : String(error));
     }
@@ -563,16 +650,16 @@ export async function handleFlexibleAssetTool(name: string, args: JsonRecord, cl
 
     if (name === config.searchName) {
       const nameQuery = typeof args.name === "string" ? args.name.trim() : "";
-      const pageSize = typeof args.page_size === "number"
+      const pageSize = typeof args.page_size === "number" && Number.isFinite(args.page_size)
         ? Math.min(Math.max(Math.trunc(args.page_size), 1), 1000)
         : nameQuery ? 1000 : 100;
-      const pageNumber = typeof args.page_number === "number" ? Math.max(Math.trunc(args.page_number), 1) : 1;
+      const pageNumber = positivePage(args.page_number, 1);
       // IT Glue's filter[name] is exact-match only. Fetch the page and apply
       // the user-facing partial match locally so "corp" finds "Corp Wi-Fi".
       const records = await fetchAssets(client, schema, organizationId, pageSize, pageNumber);
       const nameFilter = typeof args.name === "string" ? args.name.trim().toLowerCase() : "";
-      const filtered = nameFilter ? records.filter((record) => String(record.name ?? "").toLowerCase().includes(nameFilter)) : records;
-      return textResult({ data: filtered.map((record) => normalizeRecord(redactRecord(record, schema.fields), schema)) });
+      const filtered = nameFilter ? records.data.filter((record) => String(record.name ?? "").toLowerCase().includes(nameFilter)) : records.data;
+      return textResult({ data: filtered.map((record) => normalizeRecord(redactRecord(record, schema.fields), schema)), pagination: records.pagination });
     }
 
     if (name === config.getName) {
@@ -585,9 +672,18 @@ export async function handleFlexibleAssetTool(name: string, args: JsonRecord, cl
     validateFields(schema, values, name === config.createName);
 
     if (name === config.createName) {
-      const records = await fetchAssets(client, schema, organizationId, 1000);
-      const duplicate = records.find((record) => identityMatches(schema, record, values));
+      const records = await fetchAssets(client, schema, organizationId, 1000, 1, ASSET_SCAN_MAX_PAGES);
+      const duplicate = records.data.find((record) => identityMatches(schema, record, values));
       if (duplicate) return errorResult(`A matching ${schema.name} already exists: ${duplicate.id}. Use the update tool instead.`);
+      if (!records.pagination.complete) return errorResult(`Duplicate identity check is incomplete (${records.pagination.reason}); no asset was created.`);
+      const unreadableIdentity = records.data.some((record) => schema.identityInputNames.some((inputName) => {
+        const fieldDef = fieldDefForInput(schema, inputName);
+        if (!fieldDef) return true;
+        if (fieldDef.kind === "Tag" && tagIds(values[inputName]).length === 0) return false;
+        const value = getTrait(record, fieldDef);
+        return value === undefined || value === null || (fieldDef.kind === "Tag" && tagIds(value).length === 0);
+      }));
+      if (unreadableIdentity) return errorResult("Duplicate identity check is incomplete (missing identity fields); no asset was created.");
       const created = await client.post<JsonRecord>("/flexible_assets", assetBody(schema, organizationId, values));
       return textResult(normalizeRecord(redactRecord(created, schema.fields), schema));
     }
