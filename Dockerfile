@@ -1,4 +1,4 @@
-FROM node:26-alpine AS builder
+FROM node:26-alpine@sha256:6bd9ab43c0ec0190ca7b2d193906cb8b7edf6e7f4afa43ddeccd6452710bffb5 AS builder
 
 WORKDIR /app
 
@@ -14,7 +14,11 @@ RUN npm run build
 # Keep the runtime image limited to production dependencies.
 RUN npm prune --omit=dev --ignore-scripts
 
-FROM node:26-alpine AS runner
+FROM node:26-alpine@sha256:6bd9ab43c0ec0190ca7b2d193906cb8b7edf6e7f4afa43ddeccd6452710bffb5 AS runner
+
+# Match the patched Alpine runtime used by the other Summit services.
+# CVE-2026-4738 is fixed by the official Alpine zlib 1.4 package.
+RUN apk add --no-cache 'zlib>=1.4-r0'
 
 LABEL io.modelcontextprotocol.server.name="io.github.WYRE-AI/itglue-mcp"
 
