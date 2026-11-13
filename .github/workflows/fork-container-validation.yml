@@ -181,6 +181,13 @@ jobs:
           node scripts/release-checks.mjs scan-summary "$RUNNER_TEMP/image-scan.json" "$EVIDENCE/image-scan-summary.json"
           test "$SCAN_OUTCOME" = success
 
+      # Keep the established fixable HIGH/CRITICAL gate above, and retain the
+      # complete advisory inventory so lower-severity/unfixed risks stay visible.
+      - name: Retain full-severity image vulnerability inventory
+        run: |
+          set -euo pipefail
+          trivy image --scanners vuln --format json --output "$RUNNER_TEMP/image-full-scan.json" "$LOCAL_IMAGE"
+          node scripts/release-checks.mjs scan-summary "$RUNNER_TEMP/image-full-scan.json" "$EVIDENCE/image-full-scan-summary.json"
       - name: Generate exact image CycloneDX SBOM
         uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
         with:
