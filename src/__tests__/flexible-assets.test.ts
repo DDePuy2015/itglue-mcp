@@ -8,7 +8,7 @@ import {
 
 function fakeClient(overrides: Partial<FlexibleAssetClient> = {}): FlexibleAssetClient {
   return {
-    request: vi.fn(async () => ({ data: [], meta: {} })),
+    request: vi.fn(async () => ({ data: [], meta: { currentPage: 1, nextPage: null, totalPages: 1, totalCount: 0 } })),
     get: vi.fn(async () => ({})),
     post: vi.fn(async () => ({ id: "900", type: "flexible-assets", name: "Created", traits: {} })),
     patch: vi.fn(async () => ({ id: "900", type: "flexible-assets", name: "Updated", traits: {} })),
